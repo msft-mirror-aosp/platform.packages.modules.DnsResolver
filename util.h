@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <string>
 
 #include <netinet/in.h>
@@ -29,6 +30,9 @@ socklen_t sockaddrSize(const sockaddr_storage& ss);
 // TODO: getExperimentFlagString
 // TODO: Migrate it to DnsResolverExperiments.cpp
 int getExperimentFlagInt(const std::string& flagName, int defaultValue);
+
+// Convert time_point to readable string format "hr:min:sec.ms".
+std::string timestampToString(const std::chrono::system_clock::time_point& ts);
 
 // When sdk X release branch is created, aosp's sdk version would still be X-1,
 // internal would be X. Also there might be some different setting between real devices and
@@ -46,4 +50,9 @@ inline uint64_t getApiLevel() {
     uint64_t firstApiLevel =
             android::base::GetUintProperty<uint64_t>("ro.product.first_api_level", 0);
     return std::max(buildVersionSdk + !!buildVersionPreviewSdk, firstApiLevel);
+}
+
+// It's the identical strategy as frameworks/base/core/java/android/os/Build.java did.
+inline bool isUserDebugBuild() {
+    return (android::base::GetProperty("ro.build.type", "user") == "userdebug");
 }

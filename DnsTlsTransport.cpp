@@ -70,9 +70,14 @@ bool DnsTlsTransport::sendQuery(const DnsTlsQueryMap::Query& q) {
 void DnsTlsTransport::doConnect() {
     LOG(DEBUG) << "Constructing new socket";
     mSocket = mFactory->createDnsTlsSocket(mServer, mMark, this, &mCache);
+
+    bool success = true;
+    if (mSocket.get() == nullptr || !mSocket->startHandshake()) {
+        success = false;
+    }
     mConnectCounter++;
 
-    if (mSocket) {
+    if (success) {
         auto queries = mQueries.getAll();
         LOG(DEBUG) << "Initialization succeeded.  Reissuing " << queries.size() << " queries.";
         for(auto& q : queries) {
@@ -153,8 +158,8 @@ DnsTlsTransport::~DnsTlsTransport() {
 // static
 // TODO: Use this function to preheat the session cache.
 // That may require moving it to DnsTlsDispatcher.
-bool DnsTlsTransport::validate(const DnsTlsServer& server, unsigned netid, uint32_t mark) {
-    LOG(DEBUG) << "Beginning validation on " << netid;
+bool DnsTlsTransport::validate(const DnsTlsServer& server, uint32_t mark) {
+    LOG(DEBUG) << "Beginning validation with mark " << std::hex << mark;
     // Generate "<random>-dnsotls-ds.metric.gstatic.com", which we will lookup through |ss| in
     // order to prove that it is actually a working DNS over TLS server.
     static const char kDnsSafeChars[] =
@@ -190,7 +195,7 @@ bool DnsTlsTransport::validate(const DnsTlsServer& server, unsigned netid, uint3
     DnsTlsTransport transport(server, mark, &factory);
     auto r = transport.query(netdutils::Slice(query, qlen)).get();
     if (r.code != Response::success) {
-        LOG(DEBUG) << "query failed";
+        LOG(WARNING) << "query failed";
         return false;
     }
 
@@ -207,7 +212,7 @@ bool DnsTlsTransport::validate(const DnsTlsServer& server, unsigned netid, uint3
     }
 
     const int ancount = (recvbuf[6] << 8) | recvbuf[7];
-    LOG(DEBUG) << netid << " answer count: " << ancount;
+    LOG(DEBUG) << "answer count: " << ancount;
 
     // TODO: Further validate the response contents (check for valid AAAA record, ...).
     // Note that currently, integration tests rely on this function accepting a

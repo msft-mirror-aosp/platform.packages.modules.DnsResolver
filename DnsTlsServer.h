@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include <chrono>
 #include <set>
 #include <string>
 #include <vector>
@@ -24,6 +23,8 @@
 #include <netinet/in.h>
 
 #include <params.h>
+
+#include "PrivateDnsCommon.h"
 
 namespace android {
 namespace net {
@@ -38,31 +39,48 @@ struct DnsTlsServer {
     DnsTlsServer(const sockaddr_storage& ss) : ss(ss) {}
 
     // The server location, including IP and port.
+    // TODO: make it const.
     sockaddr_storage ss = {};
 
     // The server's hostname.  If this string is nonempty, the server must present a
     // certificate that indicates this name and has a valid chain to a trusted root CA.
+    // TODO: make it const.
     std::string name;
 
     // The certificate of the CA that signed the server's certificate.
     // It is used to store temporary test CA certificate for internal tests.
+    // TODO: make it const.
     std::string certificate;
 
     // Placeholder.  More protocols might be defined in the future.
+    // TODO: make it const.
     int protocol = IPPROTO_TCP;
-
-    // The time to wait for the attempt on connecting to the server.
-    // Set the default value 127 seconds to be consistent with TCP connect timeout.
-    // (presume net.ipv4.tcp_syn_retries = 6)
-    static constexpr std::chrono::milliseconds kDotConnectTimeoutMs =
-            std::chrono::milliseconds(127 * 1000);
-    std::chrono::milliseconds connectTimeout = kDotConnectTimeoutMs;
 
     // Exact comparison of DnsTlsServer objects
     bool operator<(const DnsTlsServer& other) const;
     bool operator==(const DnsTlsServer& other) const;
 
     bool wasExplicitlyConfigured() const;
+    std::string toIpString() const;
+
+    Validation validationState() const { return mValidation; }
+    void setValidationState(Validation val) { mValidation = val; }
+
+    // The socket mark used for validation.
+    // Note that the mark of a connection to which the DnsResolver sends app's DNS requests can
+    // be different.
+    // TODO: make it const.
+    uint32_t mark = 0;
+
+    // Return whether or not the server can be used for a network. It depends on
+    // the resolver configuration.
+    bool active() const { return mActive; }
+    void setActive(bool val) { mActive = val; }
+
+  private:
+    // State, unrelated to the comparison of DnsTlsServer objects.
+    Validation mValidation = Validation::unknown_server;
+    bool mActive = false;
 };
 
 // This comparison only checks the IP address.  It ignores ports, names, and fingerprints.

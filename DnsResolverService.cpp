@@ -32,6 +32,7 @@
 #include "DnsResolver.h"
 #include "Experiments.h"
 #include "NetdPermissions.h"  // PERM_*
+#include "PrivateDnsConfiguration.h"
 #include "ResolverEventReporter.h"
 #include "resolv_cache.h"
 
@@ -72,9 +73,9 @@ inline ::ndk::ScopedAStatus statusFromErrcode(int ret) {
 
 DnsResolverService::DnsResolverService() {
     // register log callback to BnDnsResolver::logFunc
-    BnDnsResolver::logFunc =
-            std::bind(binderCallLogFn, std::placeholders::_1,
-                      [](const std::string& msg) { gResNetdCallbacks.log(msg.c_str()); });
+    BnDnsResolver::logFunc = [](const auto& log) {
+        binderCallLogFn(log, [](const std::string& msg) { gResNetdCallbacks.log(msg.c_str()); });
+    };
 }
 
 binder_status_t DnsResolverService::start() {
@@ -117,6 +118,8 @@ binder_status_t DnsResolverService::dump(int fd, const char** args, uint32_t num
         gDnsResolv->resolverCtrl.dump(dw, netId);
         dw.blankline();
     }
+
+    PrivateDnsConfiguration::getInstance().dump(dw);
     Experiments::getInstance()->dump(dw);
     return STATUS_OK;
 }
@@ -136,6 +139,14 @@ binder_status_t DnsResolverService::dump(int fd, const char** args, uint32_t num
     int res = ResolverEventReporter::getInstance().addListener(listener);
 
     return statusFromErrcode(res);
+}
+
+::ndk::ScopedAStatus DnsResolverService::registerUnsolicitedEventListener(
+        const std::shared_ptr<
+                aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener>&) {
+    ENFORCE_NETWORK_STACK_PERMISSIONS();
+
+    return ::ndk::ScopedAStatus(AStatus_newOk());
 }
 
 ::ndk::ScopedAStatus DnsResolverService::checkAnyPermission(

@@ -46,9 +46,6 @@
 // The name servers are retrieved from the cache which is associated
 // with the network to which ResState is associated.
 struct ResState;
-
-typedef std::multimap<std::string /* hostname */, std::string /* IPv4/IPv6 address */> HostMapping;
-
 void resolv_populate_res_for_net(ResState* statp);
 
 std::vector<unsigned> resolv_list_caches();
@@ -100,7 +97,6 @@ int resolv_flush_cache_for_net(unsigned netid);
 // Get transport types to a given network.
 android::net::NetworkType resolv_get_network_types_for_net(unsigned netid);
 
-// For test only.
 // Return true if the cache is existent in the given network, false otherwise.
 bool has_named_cache(unsigned netid);
 

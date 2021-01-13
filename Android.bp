@@ -13,6 +13,10 @@ cc_library_headers {
 cc_library_headers {
     name: "dnsproxyd_protocol_headers",
     export_include_dirs: ["include/dnsproxyd_protocol"],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.tethering",
+    ],
 }
 
 aidl_interface {
@@ -23,6 +27,8 @@ aidl_interface {
         "binder/android/net/ResolverHostsParcel.aidl",
         "binder/android/net/ResolverOptionsParcel.aidl",
         "binder/android/net/ResolverParamsParcel.aidl",
+        // New AIDL classes should go into android.net.resolv.aidl so they can be clearly identified
+        "binder/android/net/resolv/aidl/**/*.aidl",
     ],
     imports: [
         "netd_event_listener_interface",
@@ -50,6 +56,7 @@ aidl_interface {
         "4",
         "5",
         "6",
+        "7",
     ],
 }
 
@@ -101,7 +108,6 @@ cc_library {
         "res_cache.cpp",
         "res_comp.cpp",
         "res_debug.cpp",
-        "res_init.cpp",
         "res_mkquery.cpp",
         "res_query.cpp",
         "res_send.cpp",
@@ -259,6 +265,8 @@ cc_test {
         "DnsQueryLogTest.cpp",
         "DnsStatsTest.cpp",
         "ExperimentsTest.cpp",
+        "OperationLimiterTest.cpp",
+        "PrivateDnsConfigurationTest.cpp",
     ],
     shared_libs: [
         "libcrypto",
@@ -268,7 +276,7 @@ cc_test {
     static_libs: [
         "dnsresolver_aidl_interface-unstable-ndk_platform",
         "netd_aidl_interface-ndk_platform",
-        "netd_event_listener_interface-ndk_platform",
+        "netd_event_listener_interface-unstable-ndk_platform",
         "libcutils",
         "libgmock",
         "libnetd_resolv",

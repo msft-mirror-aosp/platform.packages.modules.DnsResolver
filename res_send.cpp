@@ -111,7 +111,6 @@
 
 #include "res_comp.h"
 #include "res_debug.h"
-#include "res_init.h"
 #include "resolv_cache.h"
 #include "stats.h"
 #include "stats.pb.h"
@@ -143,8 +142,6 @@ using android::net::PROTO_UDP;
 using android::netdutils::IPSockAddr;
 using android::netdutils::Slice;
 using android::netdutils::Stopwatch;
-
-static DnsTlsDispatcher sDnsTlsDispatcher;
 
 static int send_vc(res_state statp, res_params* params, const uint8_t* buf, int buflen,
                    uint8_t* ans, int anssiz, int* terrno, size_t ns, time_t* at, int* rcode,
@@ -1255,8 +1252,8 @@ static int res_tls_send(res_state statp, const Slice query, const Slice answer, 
 
     LOG(INFO) << __func__ << ": performing query over TLS";
 
-    const auto response = sDnsTlsDispatcher.query(privateDnsStatus.validatedServers(), statp, query,
-                                                  answer, &resplen);
+    const auto response = DnsTlsDispatcher::getInstance().query(privateDnsStatus.validatedServers(),
+                                                                statp, query, answer, &resplen);
 
     LOG(INFO) << __func__ << ": TLS query result: " << static_cast<int>(response);
 
@@ -1300,8 +1297,7 @@ int resolv_res_nsend(const android_net_context* netContext, const uint8_t* msg, 
                      uint8_t* ans, int ansLen, int* rcode, uint32_t flags,
                      NetworkDnsEventReported* event) {
     assert(event != nullptr);
-    ResState res;
-    res_init(&res, netContext, event);
+    ResState res(netContext, event);
     resolv_populate_res_for_net(&res);
     *rcode = NOERROR;
     return res_nsend(&res, msg, msgLen, ans, ansLen, rcode, flags);
