@@ -71,6 +71,7 @@
 #include "tests/dns_responder/dns_tls_frontend.h"
 #include "tests/resolv_test_utils.h"
 #include "tests/tun_forwarder.h"
+#include "tests/unsolicited_listener/unsolicited_event_listener.h"
 
 // Valid VPN netId range is 100 ~ 65535
 constexpr int TEST_VPN_NETID = 65502;
@@ -94,6 +95,10 @@ using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
 using aidl::android::net::ResolverParamsParcel;
 using aidl::android::net::metrics::INetdEventListener;
+using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
+using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
+using aidl::android::net::resolv::aidl::Nat64PrefixEventParcel;
+using aidl::android::net::resolv::aidl::PrivateDnsValidationEventParcel;
 using android::base::Error;
 using android::base::ParseInt;
 using android::base::Result;
@@ -102,6 +107,7 @@ using android::base::unique_fd;
 using android::net::ResolverStats;
 using android::net::TunForwarder;
 using android::net::metrics::DnsMetricsListener;
+using android::net::resolv::aidl::UnsolicitedEventListener;
 using android::netdutils::enableSockopt;
 using android::netdutils::makeSlice;
 using android::netdutils::ResponseCode;
@@ -204,6 +210,12 @@ class ResolverTest : public ::testing::Test {
                 TEST_NETID /*monitor specific network*/);
         ASSERT_TRUE(resolvService->registerEventListener(sDnsMetricsListener).isOk());
 
+        // Subscribe the unsolicited event listener for verifying unsolicited event contents.
+        sUnsolicitedEventListener = ndk::SharedRefBase::make<UnsolicitedEventListener>(
+                TEST_NETID /*monitor specific network*/);
+        ASSERT_TRUE(
+                resolvService->registerUnsolicitedEventListener(sUnsolicitedEventListener).isOk());
+
         // Start the binder thread pool for listening DNS metrics events and receiving death
         // recipient.
         ABinderProcess_startThreadPool();
@@ -214,6 +226,7 @@ class ResolverTest : public ::testing::Test {
     void SetUp() {
         mDnsClient.SetUp();
         sDnsMetricsListener->reset();
+        sUnsolicitedEventListener->reset();
     }
 
     void TearDown() {
@@ -247,15 +260,25 @@ class ResolverTest : public ::testing::Test {
 
     bool WaitForNat64Prefix(ExpectNat64PrefixStatus status,
                             std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
-        return sDnsMetricsListener->waitForNat64Prefix(status, timeout);
+        return sDnsMetricsListener->waitForNat64Prefix(status, timeout) &&
+               sUnsolicitedEventListener->waitForNat64Prefix(
+                       status == EXPECT_FOUND
+                               ? IDnsResolverUnsolicitedEventListener::PREFIX_OPERATION_ADDED
+                               : IDnsResolverUnsolicitedEventListener::PREFIX_OPERATION_REMOVED,
+                       timeout);
     }
 
     bool WaitForPrivateDnsValidation(std::string serverAddr, bool validated) {
-        return sDnsMetricsListener->waitForPrivateDnsValidation(serverAddr, validated);
+        return sDnsMetricsListener->waitForPrivateDnsValidation(serverAddr, validated) &&
+               sUnsolicitedEventListener->waitForPrivateDnsValidation(
+                       serverAddr,
+                       validated ? IDnsResolverUnsolicitedEventListener::VALIDATION_RESULT_SUCCESS
+                                 : IDnsResolverUnsolicitedEventListener::VALIDATION_RESULT_FAILURE);
     }
 
     bool hasUncaughtPrivateDnsValidation(const std::string& serverAddr) {
-        return sDnsMetricsListener->findValidationRecord(serverAddr);
+        return sDnsMetricsListener->findValidationRecord(serverAddr) &&
+               sUnsolicitedEventListener->findValidationRecord(serverAddr);
     }
 
     void ExpectDnsEvent(int32_t eventType, int32_t returnCode, const std::string& hostname,
@@ -270,6 +293,20 @@ class ResolverTest : public ::testing::Test {
             if (dnsEvent.value() == expect) break;
             LOG(INFO) << "Skip unexpected DnsEvent: " << dnsEvent.value();
         } while (true);
+
+        while (returnCode == 0 || returnCode == RCODE_TIMEOUT) {
+            // Blocking call until timeout.
+            Result<int> result = sUnsolicitedEventListener->popDnsHealthResult();
+            ASSERT_TRUE(result.ok()) << "Expected dns health result is " << returnCode;
+            if ((returnCode == 0 &&
+                 result.value() == IDnsResolverUnsolicitedEventListener::DNS_HEALTH_RESULT_OK) ||
+                (returnCode == RCODE_TIMEOUT &&
+                 result.value() ==
+                         IDnsResolverUnsolicitedEventListener::DNS_HEALTH_RESULT_TIMEOUT)) {
+                break;
+            }
+            LOG(INFO) << "Skip unexpected dns health result:" << result.value();
+        }
     }
 
     enum class StatsCmp { LE, EQ };
@@ -366,6 +403,9 @@ class ResolverTest : public ::testing::Test {
     // could be terminated earlier.
     static std::shared_ptr<DnsMetricsListener>
             sDnsMetricsListener;  // Initialized in SetUpTestSuite.
+
+    inline static std::shared_ptr<UnsolicitedEventListener>
+            sUnsolicitedEventListener;  // Initialized in SetUpTestSuite.
 
     // Use a shared static death recipient to monitor the service death. The static death
     // recipient could monitor the death not only during the test but also between tests.
@@ -4012,6 +4052,7 @@ TEST_F(ResolverTest, SetAndClearNat64Prefix) {
     EXPECT_TRUE(WaitForNat64Prefix(EXPECT_NOT_FOUND));
 
     EXPECT_EQ(0, sDnsMetricsListener->getUnexpectedNat64PrefixUpdates());
+    EXPECT_EQ(0, sUnsolicitedEventListener->getUnexpectedNat64PrefixUpdates());
 }
 
 namespace {
@@ -4285,9 +4326,6 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout) {
             {hostname2, ns_type::ns_t_a, "1.2.3.5"},
     };
 
-    // The resolver will adjust the timeout value to 1000ms since the value is too small.
-    ScopedSystemProperties scopedSystemProperties(kDotConnectTimeoutMsFlag, "100");
-
     static const struct TestConfig {
         bool asyncHandshake;
         int maxRetries;
@@ -4316,6 +4354,8 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout) {
         test::DnsTlsFrontend tls(addr, "853", addr, "53");
         ASSERT_TRUE(tls.startServer());
 
+        // The resolver will adjust the timeout value to 1000ms since the value is too small.
+        ScopedSystemProperties scopedSystemProperties(kDotConnectTimeoutMsFlag, "100");
         ScopedSystemProperties scopedSystemProperties1(kDotAsyncHandshakeFlag,
                                                        config.asyncHandshake ? "1" : "0");
         ScopedSystemProperties scopedSystemProperties2(kDotMaxretriesFlag,
@@ -5412,8 +5452,6 @@ TEST_F(ResolverTest, DnsServerSelection) {
     StartDns(dns2, {{kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4}});
     StartDns(dns3, {{kHelloExampleCom, ns_type::ns_t_a, kHelloExampleComAddrV4}});
 
-    ScopedSystemProperties scopedSystemProperties(kSortNameserversFlag, "1");
-
     // NOTE: the servers must be sorted alphabetically.
     std::vector<std::string> serverList = {
             dns1.listen_address(),
@@ -5425,6 +5463,9 @@ TEST_F(ResolverTest, DnsServerSelection) {
         SCOPED_TRACE(fmt::format("testConfig: [{}]", fmt::join(serverList, ", ")));
         const int queryNum = 50;
         int64_t accumulatedTime = 0;
+
+        // The flag can be reset any time. It's better to re-setup the flag in each iteration.
+        ScopedSystemProperties scopedSystemProperties(kSortNameserversFlag, "1");
 
         // Restart the testing network to 1) make the flag take effect and 2) reset the statistics.
         resetNetwork();
