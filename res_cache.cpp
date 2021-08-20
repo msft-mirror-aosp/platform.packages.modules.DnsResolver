@@ -67,13 +67,17 @@
 #include "util.h"
 
 using aidl::android::net::IDnsResolver;
+using aidl::android::net::ResolverOptionsParcel;
 using android::base::StringAppendF;
 using android::net::DnsQueryEvent;
 using android::net::DnsStats;
 using android::net::Experiments;
+using android::net::PROTO_DOH;
 using android::net::PROTO_DOT;
+using android::net::PROTO_MDNS;
 using android::net::PROTO_TCP;
 using android::net::PROTO_UDP;
+using android::net::Protocol;
 using android::netdutils::DumpWriter;
 using android::netdutils::IPSockAddr;
 
@@ -257,6 +261,7 @@ static time_t _time_now(void) {
 #define DNS_TYPE_ALL "\00\0377" /* big-endian decimal 255 */
 
 #define DNS_CLASS_IN "\00\01" /* big-endian decimal 1 */
+#define MDNS_CLASS_UNICAST_IN "\200\01" /* big-endian decimal 32769 */
 
 struct DnsPacket {
     const uint8_t* base;
@@ -371,7 +376,8 @@ static int _dnsPacket_checkQR(DnsPacket* packet) {
         return 0;
     }
     /* CLASS must be IN */
-    if (!_dnsPacket_checkBytes(packet, 2, DNS_CLASS_IN)) {
+    if (!_dnsPacket_checkBytes(packet, 2, DNS_CLASS_IN) &&
+        !_dnsPacket_checkBytes(packet, 2, MDNS_CLASS_UNICAST_IN)) {
         LOG(INFO) << __func__ << ": unsupported CLASS";
         return 0;
     }
@@ -1003,7 +1009,23 @@ struct NetConfig {
         dns_event_subsampling_map = resolv_get_dns_event_subsampling_map();
     }
     int nameserverCount() { return nameserverSockAddrs.size(); }
+    int setOptions(const ResolverOptionsParcel& resolverOptions) {
+        customizedTable.clear();
+        for (const auto& host : resolverOptions.hosts) {
+            if (!host.hostName.empty() && !host.ipAddr.empty())
+                customizedTable.emplace(host.hostName, host.ipAddr);
+        }
 
+        if (resolverOptions.tcMode < aidl::android::net::IDnsResolver::TC_MODE_DEFAULT ||
+            resolverOptions.tcMode > aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP) {
+            LOG(WARNING) << __func__ << ": netid = " << netid
+                         << ", invalid TC mode: " << resolverOptions.tcMode;
+            return -EINVAL;
+        }
+        tc_mode = resolverOptions.tcMode;
+        enforceDnsUid = resolverOptions.enforceDnsUid;
+        return 0;
+    }
     const unsigned netid;
     std::unique_ptr<Cache> cache;
     std::vector<std::string> nameservers;
@@ -1177,7 +1199,7 @@ static void _cache_remove_oldest(Cache* cache) {
         return;
     }
     LOG(INFO) << __func__ << ": Cache full - removing oldest";
-    res_pquery(oldest->query, oldest->querylen);
+    res_pquery({oldest->query, oldest->querylen});
     _cache_remove_p(cache, lookup);
 }
 
@@ -1282,7 +1304,7 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, const void* query, int que
     /* remove stale entries here */
     if (now >= e->expires) {
         LOG(INFO) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
-        res_pquery(e->query, e->querylen);
+        res_pquery({e->query, e->querylen});
         _cache_remove_p(cache, lookup);
         return RESOLV_CACHE_NOTFOUND;
     }
@@ -1476,6 +1498,7 @@ int resolv_create_cache_for_net(unsigned netid) {
     }
 
     sNetConfigMap[netid] = std::make_unique<NetConfig>(netid);
+
     return 0;
 }
 
@@ -1600,7 +1623,7 @@ std::vector<std::string> getCustomizedTableByName(const size_t netid, const char
 
 int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
                            const std::vector<std::string>& domains, const res_params& params,
-                           const aidl::android::net::ResolverOptionsParcel& resolverOptions,
+                           const std::optional<ResolverOptionsParcel> optionalResolverOptions,
                            const std::vector<int32_t>& transportTypes) {
     std::vector<std::string> nameservers = filter_nameservers(servers);
     const int numservers = static_cast<int>(nameservers.size());
@@ -1649,29 +1672,25 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
     netconfig->search_domains = filter_domains(domains);
 
     // Setup stats for cleartext dns servers.
-    if (!netconfig->dnsStats.setServers(netconfig->nameserverSockAddrs, PROTO_TCP) ||
-        !netconfig->dnsStats.setServers(netconfig->nameserverSockAddrs, PROTO_UDP)) {
+    if (!netconfig->dnsStats.setAddrs(netconfig->nameserverSockAddrs, PROTO_TCP) ||
+        !netconfig->dnsStats.setAddrs(netconfig->nameserverSockAddrs, PROTO_UDP)) {
         LOG(WARNING) << __func__ << ": netid = " << netid << ", failed to set dns stats";
         return -EINVAL;
     }
-    netconfig->customizedTable.clear();
-    for (const auto& host : resolverOptions.hosts) {
-        if (!host.hostName.empty() && !host.ipAddr.empty())
-            netconfig->customizedTable.emplace(host.hostName, host.ipAddr);
-    }
-
-    if (resolverOptions.tcMode < aidl::android::net::IDnsResolver::TC_MODE_DEFAULT ||
-        resolverOptions.tcMode > aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP) {
-        LOG(WARNING) << __func__ << ": netid = " << netid
-                     << ", invalid TC mode: " << resolverOptions.tcMode;
-        return -EINVAL;
-    }
-    netconfig->tc_mode = resolverOptions.tcMode;
-    netconfig->enforceDnsUid = resolverOptions.enforceDnsUid;
-
     netconfig->transportTypes = transportTypes;
-
+    if (optionalResolverOptions.has_value()) {
+        const ResolverOptionsParcel& resolverOptions = optionalResolverOptions.value();
+        return netconfig->setOptions(resolverOptions);
+    }
     return 0;
+}
+
+int resolv_set_options(unsigned netid, const ResolverOptionsParcel& options) {
+    std::lock_guard guard(cache_mutex);
+    NetConfig* netconfig = find_netconfig_locked(netid);
+
+    if (netconfig == nullptr) return -ENONET;
+    return netconfig->setOptions(options);
 }
 
 static bool resolv_is_nameservers_equal(const std::vector<std::string>& oldServers,
@@ -1898,20 +1917,39 @@ int resolv_cache_get_expiration(unsigned netid, const std::vector<char>& query,
     return 0;
 }
 
-int resolv_stats_set_servers_for_dot(unsigned netid, const std::vector<std::string>& servers) {
+static const char* protocol_to_str(const Protocol proto) {
+    switch (proto) {
+        case PROTO_UDP:
+            return "UDP";
+        case PROTO_TCP:
+            return "TCP";
+        case PROTO_DOT:
+            return "DOT";
+        case PROTO_DOH:
+            return "DOH";
+        case PROTO_MDNS:
+            return "MDNS";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+int resolv_stats_set_addrs(unsigned netid, Protocol proto, const std::vector<std::string>& addrs,
+                           int port) {
     std::lock_guard guard(cache_mutex);
     const auto info = find_netconfig_locked(netid);
 
     if (info == nullptr) return -ENONET;
 
-    std::vector<IPSockAddr> serverSockAddrs;
-    serverSockAddrs.reserve(servers.size());
-    for (const auto& server : servers) {
-        serverSockAddrs.push_back(IPSockAddr::toIPSockAddr(server, 853));
+    std::vector<IPSockAddr> sockAddrs;
+    sockAddrs.reserve(addrs.size());
+    for (const auto& addr : addrs) {
+        sockAddrs.push_back(IPSockAddr::toIPSockAddr(addr, port));
     }
 
-    if (!info->dnsStats.setServers(serverSockAddrs, android::net::PROTO_DOT)) {
-        LOG(WARNING) << __func__ << ": netid = " << netid << ", failed to set dns stats";
+    if (!info->dnsStats.setAddrs(sockAddrs, proto)) {
+        LOG(WARNING) << __func__ << ": netid = " << netid << ", failed to set "
+                     << protocol_to_str(proto) << " stats";
         return -EINVAL;
     }
 

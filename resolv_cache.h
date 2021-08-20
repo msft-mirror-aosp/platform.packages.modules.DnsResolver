@@ -79,11 +79,11 @@ std::vector<std::string> getCustomizedTableByName(const size_t netid, const char
 // TODO: Pass all of ResolverParamsParcel and remove the res_params argument.
 int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
                            const std::vector<std::string>& domains, const res_params& params,
-                           const aidl::android::net::ResolverOptionsParcel& resolverOptions =
-                                   {{} /* hosts */,
-                                    aidl::android::net::IDnsResolver::TC_MODE_DEFAULT,
-                                    false /* enforceDnsUid */},
+                           std::optional<aidl::android::net::ResolverOptionsParcel> resolverOptions,
                            const std::vector<int32_t>& transportTypes = {});
+
+// Sets options for a given network.
+int resolv_set_options(unsigned netid, const aidl::android::net::ResolverOptionsParcel& options);
 
 // Creates the cache associated with the given network.
 int resolv_create_cache_for_net(unsigned netid);
@@ -105,8 +105,9 @@ bool has_named_cache(unsigned netid);
 // returned if the expiration time can't be acquired.
 int resolv_cache_get_expiration(unsigned netid, const std::vector<char>& query, time_t* expiration);
 
-// Set private DNS servers to DnsStats for a given network.
-int resolv_stats_set_servers_for_dot(unsigned netid, const std::vector<std::string>& servers);
+// Set addresses to DnsStats for a given network.
+int resolv_stats_set_addrs(unsigned netid, android::net::Protocol proto,
+                           const std::vector<std::string>& addrs, int port);
 
 // Add a statistics record to DnsStats for a given network.
 bool resolv_stats_add(unsigned netid, const android::netdutils::IPSockAddr& server,

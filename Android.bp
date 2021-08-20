@@ -53,12 +53,12 @@ cc_library_headers {
     ],
 }
 
-dnsresolver_aidl_interface_lateststable_version = "V8"
+dnsresolver_aidl_interface_lateststable_version = "V9"
 
 cc_library_static {
-    name: "dnsresolver_aidl_interface-lateststable-ndk_platform",
+    name: "dnsresolver_aidl_interface-lateststable-ndk",
     whole_static_libs: [
-        "dnsresolver_aidl_interface-" + dnsresolver_aidl_interface_lateststable_version + "-ndk_platform",
+        "dnsresolver_aidl_interface-" + dnsresolver_aidl_interface_lateststable_version + "-ndk",
     ],
     apex_available: [
         "com.android.resolv",
@@ -106,6 +106,7 @@ aidl_interface {
         "6",
         "7",
         "8",
+        "9",
     ],
     dumpapi: {
         no_license: true,
@@ -114,6 +115,10 @@ aidl_interface {
 
 cc_defaults {
     name: "resolv_test_defaults",
+    cflags: [
+        // networkCreatePhysical and networkCreateVpn were deprecated from netd_aidl_interface v6.
+        "-Wno-error=deprecated-declarations",
+    ],
     // Note that, static link liblog and libbase is a hard requirement for resolv related tests
     // because libbase is not compatible between Q and R for general platform build due
     // to its log revelant functions changing. And most of resolv related tests must be able to run
@@ -187,15 +192,16 @@ cc_library {
     // Link most things statically to minimize our dependence on system ABIs.
     stl: "libc++_static",
     static_libs: [
-        "dnsresolver_aidl_interface-lateststable-ndk_platform",
+        "dnsresolver_aidl_interface-lateststable-ndk",
         "libbase",
         "libcutils",
         "libnetdutils",
+        "libdoh_ffi",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
         "libstatspush_compat",
         "libsysutils",
-        "netd_event_listener_interface-lateststable-ndk_platform",
+        "netd_event_listener_interface-lateststable-ndk",
         "server_configurable_flags",
         "stats_proto",
     ],
@@ -259,7 +265,8 @@ cc_library_static {
 genrule {
     name: "statslog_resolv.h",
     tools: ["stats-log-api-gen"],
-    cmd: "$(location stats-log-api-gen) --header $(genDir)/statslog_resolv.h --module resolv --namespace android,net,stats",
+    cmd: "$(location stats-log-api-gen) --header $(genDir)/statslog_resolv.h --module resolv" +
+         " --namespace android,net,stats --minApiLevel 29",
     out: [
         "statslog_resolv.h",
     ],
@@ -268,7 +275,8 @@ genrule {
 genrule {
     name: "statslog_resolv.cpp",
     tools: ["stats-log-api-gen"],
-    cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv --namespace android,net,stats --importHeader statslog_resolv.h --supportQ",
+    cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv" +
+         " --namespace android,net,stats --importHeader statslog_resolv.h --minApiLevel 29",
     out: [
         "statslog_resolv.cpp",
     ],
@@ -325,7 +333,8 @@ rust_ffi_static {
     rlibs: [
         "libandroid_logger",
         "libanyhow",
-        "liblazy_static",
+        "libbase64_rust",
+        "libfutures",
         "liblibc",
         "liblog_rust",
         "libquiche",
@@ -360,13 +369,44 @@ rust_test {
     rustlibs: [
         "libandroid_logger",
         "libanyhow",
-        "liblazy_static",
+        "libbase64_rust",
+        "libfutures",
         "liblibc",
         "liblog_rust",
         "libquiche_static",
         "libring",
         "libtokio",
         "liburl",
+    ],
+    min_sdk_version: "29",
+}
+
+// It's required by unit tests.
+rust_ffi_static {
+    name: "libdoh_ffi_for_test",
+    crate_name: "doh",
+    srcs: ["doh.rs"],
+    edition: "2018",
+
+    rlibs: [
+        "libandroid_logger",
+        "libanyhow",
+        "libbase64_rust",
+        "libfutures",
+        "liblibc",
+        "liblog_rust",
+        "libquiche_static",
+        "libring",
+        "libtokio",
+        "liburl",
+    ],
+    prefer_rlib: true,
+    // TODO(b/194022174), for unit tests to run on the Android 10 platform,
+    // libunwind must be statically linked.
+    whole_static_libs: ["libunwind"],
+    apex_available: [
+        "//apex_available:platform",  // Needed by doh_ffi_test
+        "com.android.resolv"
     ],
     min_sdk_version: "29",
 }
