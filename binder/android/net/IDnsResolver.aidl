@@ -16,6 +16,7 @@
 
 package android.net;
 
+import android.net.ResolverOptionsParcel;
 import android.net.ResolverParamsParcel;
 import android.net.metrics.INetdEventListener;
 import android.net.resolv.aidl.IDnsResolverUnsolicitedEventListener;
@@ -196,6 +197,7 @@ interface IDnsResolver {
     const int TRANSPORT_WIFI_AWARE = 5;
     const int TRANSPORT_LOWPAN = 6;
     const int TRANSPORT_TEST = 7;
+    const int TRANSPORT_USB = 8;
 
     /**
      * Sets the NAT64 prefix for the given network.
@@ -232,4 +234,14 @@ interface IDnsResolver {
     *         unix errno.
     */
     void registerUnsolicitedEventListener(IDnsResolverUnsolicitedEventListener listener);
+
+    /**
+     * Sets resolver options for the given network.
+     *
+     * @param netId the netId on which to set the options.
+     * @param optionParams the option parameters to be wrapped into parcel.
+     * @throws ServiceSpecificException in case of failure, with an error code corresponding to the
+     *         unix errno.
+     */
+    void setResolverOptions(int netId, in ResolverOptionsParcel optionParams);
 }

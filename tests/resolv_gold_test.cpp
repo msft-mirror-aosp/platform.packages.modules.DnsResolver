@@ -22,7 +22,6 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/result.h>
-#include <android-base/stringprintf.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
@@ -40,7 +39,6 @@
 namespace android::net {
 
 using android::base::Result;
-using android::base::StringPrintf;
 using android::netdutils::ScopedAddrinfo;
 using std::chrono::milliseconds;
 
@@ -109,7 +107,7 @@ class TestBase : public ::testing::Test {
         ASSERT_EQ(privateDnsConfiguration.set(TEST_NETID, fwmark.intValue, tlsServers, tlsHostname,
                                               caCert),
                   0);
-        ASSERT_EQ(resolv_set_nameservers(TEST_NETID, servers, domains, kParams), 0);
+        ASSERT_EQ(resolv_set_nameservers(TEST_NETID, servers, domains, kParams, std::nullopt), 0);
     }
 
     void SetResolvers() { SetResolverConfiguration(kDefaultServers, kDefaultSearchDomains); }
@@ -396,8 +394,8 @@ class ResolvGoldTest : public TestBase, public ::testing::WithParamInterface<Gol
     // Generate readable string for test name from test parameters.
     static std::string Name(const ::testing::TestParamInfo<GoldTestParamType>& info) {
         const auto& [protocol, file] = info.param;
-        std::string name = StringPrintf(
-                "%s_%s", protocol == DnsProtocol::CLEARTEXT ? "CLEARTEXT" : "TLS", file.c_str());
+        std::string name = fmt::format(
+                "{}_{}", protocol == DnsProtocol::CLEARTEXT ? "CLEARTEXT" : "TLS", file);
         std::replace_if(
                 std::begin(name), std::end(name), [](char ch) { return !std::isalnum(ch); }, '_');
         return name;

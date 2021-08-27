@@ -29,7 +29,6 @@
 #include <aidl/android/net/IDnsResolver.h>
 #include <android-base/file.h>
 #include <android-base/format.h>
-#include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <android/binder_manager.h>
@@ -52,7 +51,6 @@ using aidl::android::net::ResolverOptionsParcel;
 using aidl::android::net::ResolverParamsParcel;
 using aidl::android::net::metrics::INetdEventListener;
 using android::base::ReadFdToString;
-using android::base::StringPrintf;
 using android::base::unique_fd;
 using android::net::ResolverStats;
 using android::net::metrics::TestOnDnsEvent;
@@ -123,9 +121,9 @@ class DnsResolverBinderTest : public ::testing::Test {
         // Basic regexp to match dump output lines. Matches the beginning and end of the line, and
         // puts the output of the command itself into the first match group.
         // Example: "      11-05 00:23:39.481 myCommand(args) <2.02ms>".
-        // Note: There are 4 leading blank characters in Q, but 6 in R.
+        // Accept any number of the leading space.
         const std::basic_regex lineRegex(
-                "^ {4,6}[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3} "
+                "^\\s*[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3} "
                 "(.*)"
                 " <[0-9]+[.][0-9]{2}ms>$");
 
@@ -136,7 +134,16 @@ class DnsResolverBinderTest : public ::testing::Test {
                     std::any_of(lines.begin(), lines.end(), [&](const std::string& line) {
                         std::smatch match;
                         if (!std::regex_match(line, match, lineRegex)) return false;
-                        return (match.size() == 2) && (match[1].str() == td.output);
+                        if (match.size() != 2) return false;
+
+                        // The binder_to_string format is changed from S that will add "(null)" to
+                        // the log on method's argument if binder object is null. But Q and R don't
+                        // have this format in log. So to make register null listener tests are
+                        // compatible from all version, just remove the "(null)" argument from
+                        // output logs if existed.
+                        const std::string output = android::base::StringReplace(
+                                match[1].str(), "(null)", "", /*all=*/true);
+                        return output == td.output;
                     });
             EXPECT_TRUE(found) << "Didn't find line '" << td.output << "' in dumpsys output.";
             if (found) continue;
@@ -199,9 +206,10 @@ class DnsResolverBinderTest : public ::testing::Test {
         return o;
     }
 
-    std::string toString(const ResolverOptionsParcel& parms) {
+    std::string toString(const std::optional<ResolverOptionsParcel>& parms) {
+        if (!parms.has_value()) return "(null)";
         return fmt::format("ResolverOptionsParcel{{hosts: [{}], tcMode: {}, enforceDnsUid: {}}}",
-                           toString(parms.hosts), parms.tcMode, parms.enforceDnsUid);
+                           toString(parms->hosts), parms->tcMode, parms->enforceDnsUid);
     }
 
     std::string toString(const ResolverParamsParcel& parms) {
@@ -445,12 +453,12 @@ TEST_F(DnsResolverBinderTest, SetResolverConfiguration_Tls) {
         ::ndk::ScopedAStatus status = mDnsResolver->setResolverConfiguration(resolverParams);
 
         if (td.expectedReturnCode == 0) {
-            SCOPED_TRACE(StringPrintf("test case %zu should have passed", i));
+            SCOPED_TRACE(fmt::format("test case {} should have passed", i));
             SCOPED_TRACE(status.getMessage());
             EXPECT_EQ(0, status.getServiceSpecificError());
             mExpectedLogDataWithPacel.push_back(toSetResolverConfigurationLogData(resolverParams));
         } else {
-            SCOPED_TRACE(StringPrintf("test case %zu should have failed", i));
+            SCOPED_TRACE(fmt::format("test case {} should have failed", i));
             EXPECT_EQ(EX_SERVICE_SPECIFIC, status.getExceptionCode());
             EXPECT_EQ(td.expectedReturnCode, status.getServiceSpecificError());
             mExpectedLogDataWithPacel.push_back(
@@ -615,4 +623,19 @@ TEST_F(DnsResolverBinderTest, setLogSeverity) {
     // Set back to default
     EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_WARNING).isOk());
     mExpectedLogData.push_back({"setLogSeverity(3)", "setLogSeverity.*3"});
+}
+
+TEST_F(DnsResolverBinderTest, SetResolverOptions) {
+    SKIP_IF_REMOTE_VERSION_LESS_THAN(mDnsResolver.get(), 9);
+    ResolverOptionsParcel options;
+    options.tcMode = 1;
+    options.enforceDnsUid = true;
+    EXPECT_TRUE(mDnsResolver->setResolverOptions(TEST_NETID, options).isOk());
+    mExpectedLogData.push_back(
+            {"setResolverOptions(30, " + toString(options) + ")", "setResolverOptions.*30"});
+    EXPECT_EQ(ENONET, mDnsResolver->setResolverOptions(-1, options).getServiceSpecificError());
+    mExpectedLogData.push_back({"setResolverOptions(-1, " + toString(options) +
+                                        ") -> ServiceSpecificException(64, \"Machine is not on the "
+                                        "network\")",
+                                "setResolverOptions.*-1.*64"});
 }

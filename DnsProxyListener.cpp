@@ -34,7 +34,6 @@
 #include <algorithm>
 #include <vector>
 
-#include <android-base/stringprintf.h>
 #include <android/multinetwork.h>  // ResNsendFlags
 #include <cutils/misc.h>           // FIRST_APPLICATION_UID
 #include <cutils/multiuser.h>
@@ -48,6 +47,7 @@
 #include <sysutils/SocketClient.h>
 
 #include "DnsResolver.h"
+#include "Experiments.h"
 #include "NetdPermissions.h"
 #include "OperationLimiter.h"
 #include "PrivateDnsConfiguration.h"
@@ -306,8 +306,8 @@ void initDnsEvent(NetworkDnsEventReported* event, const android_net_context& net
 
 // Return 0 if the event should not be logged.
 // Otherwise, return subsampling_denom
-uint32_t getDnsEventSubsamplingRate(int netid, int returnCode) {
-    uint32_t subsampling_denom = resolv_cache_get_subsampling_denom(netid, returnCode);
+uint32_t getDnsEventSubsamplingRate(int netid, int returnCode, bool isMdns) {
+    uint32_t subsampling_denom = resolv_cache_get_subsampling_denom(netid, returnCode, isMdns);
     if (subsampling_denom == 0) return 0;
     // Sample the event with a chance of 1 / denom.
     return (arc4random_uniform(subsampling_denom) == 0) ? subsampling_denom : 0;
@@ -334,7 +334,12 @@ void maybeLogQuery(int eventType, const android_net_context& netContext,
 void reportDnsEvent(int eventType, const android_net_context& netContext, int latencyUs,
                     int returnCode, NetworkDnsEventReported& event, const std::string& query_name,
                     const std::vector<std::string>& ip_addrs = {}, int total_ip_addr_count = 0) {
-    if (uint32_t rate = getDnsEventSubsamplingRate(netContext.dns_netid, returnCode)) {
+    uint32_t rate = (query_name.ends_with(".local") &&
+                     android::net::Experiments::getInstance()->getFlag("mdns_resolution", 1))
+                            ? getDnsEventSubsamplingRate(netContext.dns_netid, returnCode, true)
+                            : getDnsEventSubsamplingRate(netContext.dns_netid, returnCode, false);
+
+    if (rate) {
         const std::string& dnsQueryStats = event.dns_query_events().SerializeAsString();
         stats::BytesField dnsQueryBytesField{dnsQueryStats.c_str(), dnsQueryStats.size()};
         event.set_return_code(static_cast<ReturnCode>(returnCode));
@@ -560,7 +565,7 @@ bool getDns64Prefix(unsigned netId, netdutils::IPPrefix* prefix) {
 
 std::string makeThreadName(unsigned netId, uint32_t uid) {
     // The maximum of netId and app_id are 5-digit numbers.
-    return android::base::StringPrintf("Dns_%u_%u", netId, multiuser_get_app_id(uid));
+    return fmt::format("Dns_{}_{}", netId, multiuser_get_app_id(uid));
 }
 
 }  // namespace

@@ -28,15 +28,21 @@ using namespace std::chrono_literals;
 
 class PrivateDnsConfigurationTest : public ::testing::Test {
   public:
+    using ServerIdentity = PrivateDnsConfiguration::ServerIdentity;
+
     static void SetUpTestSuite() {
         // stopServer() will be called in their destructor.
         ASSERT_TRUE(tls1.startServer());
         ASSERT_TRUE(tls2.startServer());
         ASSERT_TRUE(backend.startServer());
+        ASSERT_TRUE(backend1ForUdpProbe.startServer());
+        ASSERT_TRUE(backend2ForUdpProbe.startServer());
     }
 
     void SetUp() {
         mPdc.setObserver(&mObserver);
+        mPdc.mBackoffBuilder.withInitialRetransmissionTime(std::chrono::seconds(1))
+                .withMaximumRetransmissionTime(std::chrono::seconds(1));
 
         // The default and sole action when the observer is notified of onValidationStateUpdate.
         // Don't override the action. In other words, don't use WillOnce() or WillRepeatedly()
@@ -49,7 +55,17 @@ class PrivateDnsConfigurationTest : public ::testing::Test {
         ON_CALL(mObserver, onValidationStateUpdate)
                 .WillByDefault([&](const std::string& server, Validation validation, uint32_t) {
                     if (validation == Validation::in_process) {
-                        mObserver.runningThreads++;
+                        std::lock_guard guard(mObserver.lock);
+                        auto it = mObserver.serverStateMap.find(server);
+                        if (it == mObserver.serverStateMap.end() ||
+                            it->second != Validation::in_process) {
+                            // Increment runningThreads only when receive the first in_process
+                            // notification. The rest of the continuous in_process notifications
+                            // are due to probe retry which runs on the same thread.
+                            // TODO: consider adding onValidationThreadStart() and
+                            // onValidationThreadEnd() callbacks.
+                            mObserver.runningThreads++;
+                        }
                     } else if (validation == Validation::success ||
                                validation == Validation::fail) {
                         mObserver.runningThreads--;
@@ -85,14 +101,23 @@ class PrivateDnsConfigurationTest : public ::testing::Test {
     };
 
     void expectPrivateDnsStatus(PrivateDnsMode mode) {
+        // Use PollForCondition because mObserver is notified asynchronously.
+        EXPECT_TRUE(PollForCondition([&]() { return checkPrivateDnsStatus(mode); }));
+    }
+
+    bool checkPrivateDnsStatus(PrivateDnsMode mode) {
         const PrivateDnsStatus status = mPdc.getStatus(kNetId);
-        EXPECT_EQ(status.mode, mode);
+        if (status.mode != mode) return false;
 
         std::map<std::string, Validation> serverStateMap;
         for (const auto& [server, validation] : status.serversMap) {
             serverStateMap[ToString(&server.ss)] = validation;
         }
-        EXPECT_EQ(serverStateMap, mObserver.getServerStateMap());
+        return (serverStateMap == mObserver.getServerStateMap());
+    }
+
+    bool hasPrivateDnsServer(const ServerIdentity& identity, unsigned netId) {
+        return mPdc.getPrivateDns(identity, netId).ok();
     }
 
     static constexpr uint32_t kNetId = 30;
@@ -109,6 +134,8 @@ class PrivateDnsConfigurationTest : public ::testing::Test {
     inline static test::DnsTlsFrontend tls1{kServer1, "853", kBackend, "53"};
     inline static test::DnsTlsFrontend tls2{kServer2, "853", kBackend, "53"};
     inline static test::DNSResponder backend{kBackend, "53"};
+    inline static test::DNSResponder backend1ForUdpProbe{kServer1, "53"};
+    inline static test::DNSResponder backend2ForUdpProbe{kServer2, "53"};
 };
 
 TEST_F(PrivateDnsConfigurationTest, ValidationSuccess) {
@@ -135,6 +162,40 @@ TEST_F(PrivateDnsConfigurationTest, ValidationFail_Opportunistic) {
     // Strictly wait for all of the validation finish; otherwise, the test can crash somehow.
     ASSERT_TRUE(PollForCondition([&]() { return mObserver.runningThreads == 0; }));
     ASSERT_TRUE(backend.startServer());
+}
+
+TEST_F(PrivateDnsConfigurationTest, Revalidation_Opportunistic) {
+    const DnsTlsServer server(netdutils::IPSockAddr::toIPSockAddr(kServer1, 853));
+
+    // Step 1: Set up and wait for validation complete.
+    testing::InSequence seq;
+    EXPECT_CALL(mObserver, onValidationStateUpdate(kServer1, Validation::in_process, kNetId));
+    EXPECT_CALL(mObserver, onValidationStateUpdate(kServer1, Validation::success, kNetId));
+
+    EXPECT_EQ(mPdc.set(kNetId, kMark, {kServer1}, {}, {}), 0);
+    expectPrivateDnsStatus(PrivateDnsMode::OPPORTUNISTIC);
+    ASSERT_TRUE(PollForCondition([&]() { return mObserver.runningThreads == 0; }));
+
+    // Step 2: Simulate the DNS is temporarily broken, and then request a validation.
+    // Expect the validation to run as follows:
+    //   1. DnsResolver notifies of Validation::in_process when the validation is about to run.
+    //   2. The first probing fails. DnsResolver notifies of Validation::in_process.
+    //   3. One second later, the second probing begins and succeeds. DnsResolver notifies of
+    //      Validation::success.
+    EXPECT_CALL(mObserver, onValidationStateUpdate(kServer1, Validation::in_process, kNetId))
+            .Times(2);
+    EXPECT_CALL(mObserver, onValidationStateUpdate(kServer1, Validation::success, kNetId));
+
+    std::thread t([] {
+        std::this_thread::sleep_for(1000ms);
+        backend.startServer();
+    });
+    backend.stopServer();
+    EXPECT_TRUE(mPdc.requestValidation(kNetId, ServerIdentity(server), kMark).ok());
+
+    t.join();
+    expectPrivateDnsStatus(PrivateDnsMode::OPPORTUNISTIC);
+    ASSERT_TRUE(PollForCondition([&]() { return mObserver.runningThreads == 0; }));
 }
 
 TEST_F(PrivateDnsConfigurationTest, ValidationBlock) {
@@ -225,17 +286,14 @@ TEST_F(PrivateDnsConfigurationTest, NoValidation) {
 }
 
 TEST_F(PrivateDnsConfigurationTest, ServerIdentity_Comparison) {
-    using ServerIdentity = PrivateDnsConfiguration::ServerIdentity;
-
     DnsTlsServer server(netdutils::IPSockAddr::toIPSockAddr("127.0.0.1", 853));
     server.name = "dns.example.com";
-    server.protocol = 1;
 
-    // Different IP address (port is ignored).
+    // Different socket address.
     DnsTlsServer other = server;
     EXPECT_EQ(ServerIdentity(server), ServerIdentity(other));
     other.ss = netdutils::IPSockAddr::toIPSockAddr("127.0.0.1", 5353);
-    EXPECT_EQ(ServerIdentity(server), ServerIdentity(other));
+    EXPECT_NE(ServerIdentity(server), ServerIdentity(other));
     other.ss = netdutils::IPSockAddr::toIPSockAddr("127.0.0.2", 853);
     EXPECT_NE(ServerIdentity(server), ServerIdentity(other));
 
@@ -246,16 +304,11 @@ TEST_F(PrivateDnsConfigurationTest, ServerIdentity_Comparison) {
     EXPECT_NE(ServerIdentity(server), ServerIdentity(other));
     other.name = "";
     EXPECT_NE(ServerIdentity(server), ServerIdentity(other));
-
-    // Different protocol.
-    other = server;
-    EXPECT_EQ(ServerIdentity(server), ServerIdentity(other));
-    other.protocol++;
-    EXPECT_NE(ServerIdentity(server), ServerIdentity(other));
 }
 
 TEST_F(PrivateDnsConfigurationTest, RequestValidation) {
     const DnsTlsServer server(netdutils::IPSockAddr::toIPSockAddr(kServer1, 853));
+    const ServerIdentity identity(server);
 
     testing::InSequence seq;
 
@@ -279,29 +332,53 @@ TEST_F(PrivateDnsConfigurationTest, RequestValidation) {
         const int runningThreads = (config == "IN_PROGRESS") ? 1 : 0;
         ASSERT_TRUE(PollForCondition([&]() { return mObserver.runningThreads == runningThreads; }));
 
-        bool requestAccepted = false;
         if (config == "SUCCESS") {
             EXPECT_CALL(mObserver,
                         onValidationStateUpdate(kServer1, Validation::in_process, kNetId));
             EXPECT_CALL(mObserver, onValidationStateUpdate(kServer1, Validation::success, kNetId));
-            requestAccepted = true;
+            EXPECT_TRUE(mPdc.requestValidation(kNetId, identity, kMark).ok());
         } else if (config == "IN_PROGRESS") {
             EXPECT_CALL(mObserver, onValidationStateUpdate(kServer1, Validation::success, kNetId));
+            EXPECT_FALSE(mPdc.requestValidation(kNetId, identity, kMark).ok());
+        } else if (config == "FAIL") {
+            EXPECT_FALSE(mPdc.requestValidation(kNetId, identity, kMark).ok());
         }
 
-        EXPECT_EQ(mPdc.requestValidation(kNetId, server, kMark), requestAccepted);
-
         // Resending the same request or requesting nonexistent servers are denied.
-        EXPECT_FALSE(mPdc.requestValidation(kNetId, server, kMark));
-        EXPECT_FALSE(mPdc.requestValidation(kNetId, server, kMark + 1));
-        EXPECT_FALSE(mPdc.requestValidation(kNetId + 1, server, kMark));
+        EXPECT_FALSE(mPdc.requestValidation(kNetId, identity, kMark).ok());
+        EXPECT_FALSE(mPdc.requestValidation(kNetId, identity, kMark + 1).ok());
+        EXPECT_FALSE(mPdc.requestValidation(kNetId + 1, identity, kMark).ok());
 
         // Reset the test state.
         backend.setDeferredResp(false);
         backend.startServer();
+
+        // Ensure the status of mObserver is synced.
+        expectPrivateDnsStatus(PrivateDnsMode::OPPORTUNISTIC);
+
         ASSERT_TRUE(PollForCondition([&]() { return mObserver.runningThreads == 0; }));
         mPdc.clear(kNetId);
     }
+}
+
+TEST_F(PrivateDnsConfigurationTest, GetPrivateDns) {
+    const DnsTlsServer server1(netdutils::IPSockAddr::toIPSockAddr(kServer1, 853));
+    const DnsTlsServer server2(netdutils::IPSockAddr::toIPSockAddr(kServer2, 853));
+
+    EXPECT_FALSE(hasPrivateDnsServer(ServerIdentity(server1), kNetId));
+    EXPECT_FALSE(hasPrivateDnsServer(ServerIdentity(server2), kNetId));
+
+    // Suppress the warning.
+    EXPECT_CALL(mObserver, onValidationStateUpdate).Times(2);
+
+    EXPECT_EQ(mPdc.set(kNetId, kMark, {kServer1}, {}, {}), 0);
+    expectPrivateDnsStatus(PrivateDnsMode::OPPORTUNISTIC);
+
+    EXPECT_TRUE(hasPrivateDnsServer(ServerIdentity(server1), kNetId));
+    EXPECT_FALSE(hasPrivateDnsServer(ServerIdentity(server2), kNetId));
+    EXPECT_FALSE(hasPrivateDnsServer(ServerIdentity(server1), kNetId + 1));
+
+    ASSERT_TRUE(PollForCondition([&]() { return mObserver.runningThreads == 0; }));
 }
 
 // TODO: add ValidationFail_Strict test.

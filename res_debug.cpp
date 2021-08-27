@@ -108,18 +108,17 @@
 
 #include <aidl/android/net/IDnsResolver.h>
 #include <android-base/logging.h>
-#include <android-base/stringprintf.h>
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <netdb.h>
-#include <netdutils/Slice.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
 
+#include "doh.h"
 #include "resolv_private.h"
 
 // Default to disabling verbose logging unless overridden by Android.bp
@@ -131,7 +130,6 @@
 #endif
 
 using android::base::StringAppendF;
-using android::netdutils::Slice;
 
 struct res_sym {
     int number;            /* Identifying number, like T_MX */
@@ -232,18 +230,31 @@ static void do_section(ns_msg* handle, ns_sect section) {
     }
 }
 
+// Convert bytes to its hexadecimal representation.
+// The returned string is double the size of input.
+std::string bytesToHexStr(std::span<const uint8_t> bytes) {
+    static char const hex[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
+                                 '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    std::string str;
+    str.reserve(bytes.size() * 2);
+    for (uint8_t ch : bytes) {
+        str.append({hex[(ch & 0xf0) >> 4], hex[ch & 0xf]});
+    }
+    return str;
+}
+
 /*
  * Print the contents of a query.
  * This is intended to be primarily a debugging routine.
  */
-void res_pquery(const uint8_t* msg, int len) {
+void res_pquery(std::span<const uint8_t> msg) {
     if (!WOULD_LOG(VERBOSE)) return;
 
     ns_msg handle;
     int qdcount, ancount, nscount, arcount;
     uint32_t opcode, rcode, id;
 
-    if (ns_initparse(msg, len, &handle) < 0) {
+    if (ns_initparse(msg.data(), msg.size(), &handle) < 0) {
         PLOG(VERBOSE) << "ns_initparse failed";
         return;
     }
@@ -286,7 +297,7 @@ void res_pquery(const uint8_t* msg, int len) {
     do_section(&handle, ns_s_ar);
 
     LOG(VERBOSE) << "Hex dump:";
-    LOG(VERBOSE) << android::netdutils::toHex(Slice(const_cast<uint8_t*>(msg), len), 32);
+    LOG(VERBOSE) << bytesToHexStr(msg);
 }
 
 /*
@@ -483,9 +494,11 @@ int resolv_set_log_severity(uint32_t logSeverity) {
     switch (logSeverity) {
         case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_VERBOSE:
             logSeverity = android::base::VERBOSE;
+            doh_set_log_level(LOG_LEVEL_TRACE);
             // *** enable verbose logging only when DBG is set. It prints sensitive data ***
             if (RESOLV_ALLOW_VERBOSE_LOGGING == false) {
                 logSeverity = android::base::DEBUG;
+                doh_set_log_level(LOG_LEVEL_DEBUG);
                 LOG(ERROR) << "Refusing to set VERBOSE logging in non-debuggable build";
                 // TODO: Return EACCES then callers could know if the log
                 // severity is acceptable
@@ -493,15 +506,19 @@ int resolv_set_log_severity(uint32_t logSeverity) {
             break;
         case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_DEBUG:
             logSeverity = android::base::DEBUG;
+            doh_set_log_level(LOG_LEVEL_DEBUG);
             break;
         case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_INFO:
             logSeverity = android::base::INFO;
+            doh_set_log_level(LOG_LEVEL_INFO);
             break;
         case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_WARNING:
             logSeverity = android::base::WARNING;
+            doh_set_log_level(LOG_LEVEL_WARN);
             break;
         case aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_ERROR:
             logSeverity = android::base::ERROR;
+            doh_set_log_level(LOG_LEVEL_ERROR);
             break;
         default:
             LOG(ERROR) << __func__ << ": invalid log severity: " << logSeverity;
