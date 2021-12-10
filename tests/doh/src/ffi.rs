@@ -124,11 +124,46 @@ pub extern "C" fn frontend_set_delay_queries(doh: &mut DohFrontend, count: i32) 
     doh.set_delay_queries(count).or_else(logging_and_return_err).is_ok()
 }
 
+/// Configures the `DohFrontend` to use the given value for max_idle_timeout transport parameter.
+#[no_mangle]
+pub extern "C" fn frontend_set_max_idle_timeout(doh: &mut DohFrontend, value: u64) -> bool {
+    doh.set_max_idle_timeout(value).or_else(logging_and_return_err).is_ok()
+}
+
+/// Configures the `DohFrontend` to use the given value for these transport parameters.
+/// - initial_max_data
+/// - initial_max_stream_data_bidi_local
+/// - initial_max_stream_data_bidi_remote
+/// - initial_max_stream_data_uni
+#[no_mangle]
+pub extern "C" fn frontend_set_max_buffer_size(doh: &mut DohFrontend, value: u64) -> bool {
+    doh.set_max_buffer_size(value).or_else(logging_and_return_err).is_ok()
+}
+
+/// Configures the `DohFrontend` to use the given value for initial_max_streams_bidi transport
+/// parameter.
+#[no_mangle]
+pub extern "C" fn frontend_set_max_streams_bidi(doh: &mut DohFrontend, value: u64) -> bool {
+    doh.set_max_streams_bidi(value).or_else(logging_and_return_err).is_ok()
+}
+
+/// Sets the `DohFrontend` to block or unblock sending any data.
+#[no_mangle]
+pub extern "C" fn frontend_block_sending(doh: &mut DohFrontend, block: bool) -> bool {
+    doh.block_sending(block).or_else(logging_and_return_err).is_ok()
+}
+
 /// Gets the statistics of the `DohFrontend` and writes the result to |out|.
 #[no_mangle]
-pub extern "C" fn frontend_stats(doh: &DohFrontend, out: &mut Stats) {
-    let stats = doh.stats();
-    out.queries_received = stats.queries_received;
+pub extern "C" fn frontend_stats(doh: &mut DohFrontend, out: &mut Stats) -> bool {
+    doh.request_stats()
+        .map(|stats| {
+            out.queries_received = stats.queries_received;
+            out.connections_accepted = stats.connections_accepted;
+            out.alive_connections = stats.alive_connections;
+        })
+        .or_else(logging_and_return_err)
+        .is_ok()
 }
 
 /// Resets `queries_received` field of `Stats` owned by the `DohFrontend`.
@@ -151,6 +186,6 @@ fn to_socket_addr(addr: &str, port: &str) -> Result<SocketAddr> {
 }
 
 fn logging_and_return_err<T, U: std::fmt::Debug>(e: U) -> Result<T> {
-    warn!("{:?}", e);
+    warn!("logging_and_return_err: {:?}", e);
     bail!("{:?}", e)
 }

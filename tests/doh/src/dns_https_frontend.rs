@@ -17,7 +17,7 @@
 //! DoH server frontend.
 
 use crate::client::{ClientMap, ConnectionID, DNS_HEADER_SIZE, MAX_UDP_PAYLOAD_SIZE};
-use crate::config::Config;
+use crate::config::{Config, QUICHE_IDLE_TIMEOUT_MS};
 use crate::stats::Stats;
 use anyhow::{bail, ensure, Result};
 use lazy_static::lazy_static;
@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::mpsc::channel;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 lazy_static! {
@@ -44,11 +44,17 @@ lazy_static! {
     );
 }
 
-const QUICHE_IDLE_TIMEOUT_MS: u64 = 10_000;
-
+/// Command used by worker_thread itself.
 #[derive(Debug)]
-enum Command {
+enum InternalCommand {
     MaybeWrite { connection_id: ConnectionID },
+}
+
+/// Commands that DohFrontend to ask its worker_thread for.
+#[derive(Debug)]
+enum ControlCommand {
+    Stats { resp: oneshot::Sender<Stats> },
+    StatsClearQueries,
 }
 
 /// Frontend object.
@@ -72,11 +78,14 @@ pub struct DohFrontend {
 
     // Custom runtime configuration to control the behavior of the worker thread.
     // It's shared with the worker thread.
+    // TODO: use channel to update worker_thread configuration.
     config: Arc<Mutex<Config>>,
 
-    // Stores some statistic to check DohFrontend status.
-    // It's shared with the worker thread.
-    stats: Arc<Mutex<Stats>>,
+    // Caches the latest stats so that the stats remains after worker_thread stops.
+    latest_stats: Stats,
+
+    // It is wrapped as Option because the channel is not created in DohFrontend construction.
+    command_tx: Option<mpsc::UnboundedSender<ControlCommand>>,
 }
 
 /// The parameters passed to the worker thread.
@@ -85,7 +94,7 @@ struct WorkerParams {
     backend_socket: std::net::UdpSocket,
     clients: ClientMap,
     config: Arc<Mutex<Config>>,
-    stats: Arc<Mutex<Stats>>,
+    command_rx: mpsc::UnboundedReceiver<ControlCommand>,
 }
 
 impl DohFrontend {
@@ -100,7 +109,8 @@ impl DohFrontend {
             private_key: String::new(),
             worker_thread: None,
             config: Arc::new(Mutex::new(Config::new())),
-            stats: Arc::new(Mutex::new(Stats::new())),
+            latest_stats: Stats::new(),
+            command_tx: None,
         });
         debug!("DohFrontend created: {:?}", doh);
         Ok(doh)
@@ -123,6 +133,9 @@ impl DohFrontend {
 
     pub fn stop(&mut self) -> Result<()> {
         if let Some(worker_thread) = self.worker_thread.take() {
+            // Update latest_stats before stopping worker_thread.
+            let _ = self.request_stats();
+
             worker_thread.abort();
         }
 
@@ -145,16 +158,68 @@ impl DohFrontend {
         Ok(())
     }
 
-    pub fn stats(&self) -> Stats {
-        self.stats.lock().unwrap().clone()
-    }
-
-    pub fn stats_clear_queries(&self) -> Result<()> {
-        self.stats.lock().unwrap().queries_received = 0;
+    pub fn set_max_idle_timeout(&self, value: u64) -> Result<()> {
+        self.config.lock().unwrap().max_idle_timeout = value;
         Ok(())
     }
 
-    fn init_worker_thread_params(&self) -> Result<WorkerParams> {
+    pub fn set_max_buffer_size(&self, value: u64) -> Result<()> {
+        self.config.lock().unwrap().max_buffer_size = value;
+        Ok(())
+    }
+
+    pub fn set_max_streams_bidi(&self, value: u64) -> Result<()> {
+        self.config.lock().unwrap().max_streams_bidi = value;
+        Ok(())
+    }
+
+    pub fn block_sending(&self, value: bool) -> Result<()> {
+        self.config.lock().unwrap().block_sending = value;
+        Ok(())
+    }
+
+    pub fn request_stats(&mut self) -> Result<Stats> {
+        ensure!(
+            self.command_tx.is_some(),
+            "command_tx is None because worker thread not yet initialized"
+        );
+        let command_tx = self.command_tx.as_ref().unwrap();
+
+        if command_tx.is_closed() {
+            return Ok(self.latest_stats.clone());
+        }
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        command_tx.send(ControlCommand::Stats { resp: resp_tx })?;
+
+        match RUNTIME_STATIC
+            .block_on(async { tokio::time::timeout(Duration::from_secs(1), resp_rx).await })
+        {
+            Ok(v) => match v {
+                Ok(stats) => {
+                    self.latest_stats = stats.clone();
+                    Ok(stats)
+                }
+                Err(e) => bail!(e),
+            },
+            Err(e) => bail!(e),
+        }
+    }
+
+    pub fn stats_clear_queries(&self) -> Result<()> {
+        ensure!(
+            self.command_tx.is_some(),
+            "command_tx is None because worker thread not yet initialized"
+        );
+        return self
+            .command_tx
+            .as_ref()
+            .unwrap()
+            .send(ControlCommand::StatsClearQueries)
+            .or_else(|e| bail!(e));
+    }
+
+    fn init_worker_thread_params(&mut self) -> Result<WorkerParams> {
         let bind_addr =
             if self.backend_socket_addr.ip().is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
         let backend_socket = std::net::UdpSocket::bind(bind_addr)?;
@@ -167,14 +232,18 @@ impl DohFrontend {
         let clients = ClientMap::new(create_quiche_config(
             self.certificate.to_string(),
             self.private_key.to_string(),
+            self.config.clone(),
         )?)?;
+
+        let (command_tx, command_rx) = mpsc::unbounded_channel::<ControlCommand>();
+        self.command_tx = Some(command_tx);
 
         Ok(WorkerParams {
             frontend_socket,
             backend_socket,
             clients,
             config: self.config.clone(),
-            stats: self.stats.clone(),
+            command_rx,
         })
     }
 }
@@ -183,18 +252,19 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
     let backend_socket = into_tokio_udp_socket(params.backend_socket)?;
     let frontend_socket = into_tokio_udp_socket(params.frontend_socket)?;
     let config = params.config;
-    let stats = params.stats;
-    let (event_tx, mut event_rx) = channel::<Command>(100);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<InternalCommand>();
+    let mut command_rx = params.command_rx;
     let mut clients = params.clients;
     let mut frontend_buf = [0; 65535];
     let mut backend_buf = [0; 16384];
     let mut delay_queries_buffer: Vec<Vec<u8>> = vec![];
+    let mut queries_received = 0;
 
     debug!("frontend={:?}, backend={:?}", frontend_socket, backend_socket);
 
     loop {
         let timeout = clients
-            .get_mut_iter()
+            .iter_mut()
             .filter_map(|(_, c)| c.timeout())
             .min()
             .unwrap_or_else(|| Duration::from_millis(QUICHE_IDLE_TIMEOUT_MS));
@@ -202,12 +272,12 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {
                 debug!("timeout");
-                for (_, client) in clients.get_mut_iter() {
+                for (_, client) in clients.iter_mut() {
                     // If no timeout has occurred it does nothing.
                     client.on_timeout();
 
                     let connection_id = client.connection_id().clone();
-                    event_tx.send(Command::MaybeWrite{connection_id}).await?;
+                    event_tx.send(InternalCommand::MaybeWrite{connection_id})?;
                 }
             }
 
@@ -237,7 +307,7 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 match client.handle_frontend_message(pkt_buf) {
                     Ok(v) if !v.is_empty() => {
                         delay_queries_buffer.push(v);
-                        stats.lock().unwrap().queries_received += 1;
+                        queries_received += 1;
                     }
                     Err(e) => {
                         error!("Failed to process QUIC packet: {}", e);
@@ -254,7 +324,7 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 }
 
                 let connection_id = client.connection_id().clone();
-                event_tx.send(Command::MaybeWrite{connection_id}).await?;
+                event_tx.send(InternalCommand::MaybeWrite{connection_id})?;
             }
 
             Ok((len, src)) = backend_socket.recv_from(&mut backend_buf) => {
@@ -265,13 +335,13 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 }
 
                 let query_id = [backend_buf[0], backend_buf[1]];
-                for (_, client) in clients.get_mut_iter() {
+                for (_, client) in clients.iter_mut() {
                     if client.is_waiting_for_query(&query_id) {
                         if let Err(e) = client.handle_backend_message(&backend_buf[..len]) {
                             error!("Failed to handle message from backend: {}", e);
                         }
                         let connection_id = client.connection_id().clone();
-                        event_tx.send(Command::MaybeWrite{connection_id}).await?;
+                        event_tx.send(InternalCommand::MaybeWrite{connection_id})?;
 
                         // It's a bug if more than one client is waiting for this query.
                         break;
@@ -279,34 +349,46 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 }
             }
 
-            Some(command) = event_rx.recv() => {
+            Some(command) = event_rx.recv(), if !config.lock().unwrap().block_sending => {
                 match command {
-                    Command::MaybeWrite {connection_id} => {
+                    InternalCommand::MaybeWrite {connection_id} => {
                         if let Some(client) = clients.get_mut(&connection_id) {
-                            match client.flush_egress() {
-                                Ok(v) => {
-                                    // The DoH engine in DnsResolver can't handle empty response.
-                                    if !v.is_empty() {
-                                        let addr = client.addr();
-                                        debug!("Sending {} bytes to client {}", v.len(), addr);
-                                        if let Err(e) = frontend_socket.send_to(&v, addr).await {
-                                            error!("Failed to send packet to {:?}: {:?}", client, e);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("flush_egress failed: {}", e);
+                            while let Ok(v) = client.flush_egress() {
+                                let addr = client.addr();
+                                debug!("Sending {} bytes to client {}", v.len(), addr);
+                                if let Err(e) = frontend_socket.send_to(&v, addr).await {
+                                    error!("Failed to send packet to {:?}: {:?}", client, e);
                                 }
                             }
+                            client.process_pending_answers()?;
                         }
                     }
+                }
+            }
+            Some(command) = command_rx.recv() => {
+                match command {
+                    ControlCommand::Stats {resp} => {
+                        let stats = Stats {
+                            queries_received,
+                            connections_accepted: clients.len() as u32,
+                            alive_connections: clients.iter().filter(|(_, client)| client.is_alive()).count() as u32,
+                        };
+                        if let Err(e) = resp.send(stats) {
+                            error!("Failed to send ControlCommand::Stats response: {:?}", e);
+                        }
+                    }
+                    ControlCommand::StatsClearQueries => queries_received = 0,
                 }
             }
         }
     }
 }
 
-fn create_quiche_config(certificate: String, private_key: String) -> Result<quiche::Config> {
+fn create_quiche_config(
+    certificate: String,
+    private_key: String,
+    config: Arc<Mutex<Config>>,
+) -> Result<quiche::Config> {
     let mut quiche_config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
 
     // Use pipe as a file path for Quiche to read the certificate and the private key.
@@ -327,13 +409,16 @@ fn create_quiche_config(certificate: String, private_key: String) -> Result<quic
     handle.join().unwrap();
 
     quiche_config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-    quiche_config.set_max_idle_timeout(QUICHE_IDLE_TIMEOUT_MS);
+    quiche_config.set_max_idle_timeout(config.lock().unwrap().max_idle_timeout);
     quiche_config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD_SIZE);
-    quiche_config.set_initial_max_data(10000000);
-    quiche_config.set_initial_max_stream_data_bidi_local(1000000);
-    quiche_config.set_initial_max_stream_data_bidi_remote(1000000);
-    quiche_config.set_initial_max_stream_data_uni(1000000);
-    quiche_config.set_initial_max_streams_bidi(100);
+
+    let max_buffer_size = config.lock().unwrap().max_buffer_size;
+    quiche_config.set_initial_max_data(max_buffer_size);
+    quiche_config.set_initial_max_stream_data_bidi_local(max_buffer_size);
+    quiche_config.set_initial_max_stream_data_bidi_remote(max_buffer_size);
+    quiche_config.set_initial_max_stream_data_uni(max_buffer_size);
+
+    quiche_config.set_initial_max_streams_bidi(config.lock().unwrap().max_streams_bidi);
     quiche_config.set_initial_max_streams_uni(100);
     quiche_config.set_disable_active_migration(true);
 

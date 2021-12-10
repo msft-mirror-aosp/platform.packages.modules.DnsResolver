@@ -17,10 +17,10 @@
 #pragma once
 
 #include <climits>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
 #include <android-base/thread_annotations.h>
 #include <netdutils/DumpWriter.h>
@@ -45,7 +45,7 @@ class Experiments {
     Experiments() = delete;
     void updateInternal() EXCLUDES(mMutex);
     mutable std::mutex mMutex;
-    std::unordered_map<std::string_view, int> mFlagsMapInt GUARDED_BY(mMutex);
+    std::map<std::string_view, int> mFlagsMapInt GUARDED_BY(mMutex);
     // TODO: Migrate other experiment flags to here.
     // (retry_count, retransmission_time_interval)
     static constexpr const char* const kExperimentFlagKeyList[] = {
@@ -64,6 +64,7 @@ class Experiments {
             "doh",
             "doh_query_timeout_ms",
             "doh_probe_timeout_ms",
+            "doh_idle_timeout_ms",
             "mdns_resolution",
     };
     // This value is used in updateInternal as the default value if any flags can't be found.

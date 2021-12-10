@@ -17,7 +17,7 @@
 //! Client management, including the communication with quiche I/O.
 
 use anyhow::{anyhow, bail, ensure, Result};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use quiche::h3::NameValue;
 use ring::hmac;
 use ring::rand::SystemRandom;
@@ -50,11 +50,22 @@ pub struct Client {
     /// Queues the DNS queries being processed in backend.
     /// <Query ID, Stream ID>
     in_flight_queries: HashMap<[u8; 2], u64>,
+
+    /// Queues the second part DNS answers needed to be sent after first part.
+    /// <Stream ID, ans>
+    pending_answers: Vec<(u64, Vec<u8>)>,
 }
 
 impl Client {
     fn new(conn: Pin<Box<quiche::Connection>>, addr: &SocketAddr, id: ConnectionID) -> Client {
-        Client { conn, h3_conn: None, addr: *addr, id, in_flight_queries: HashMap::new() }
+        Client {
+            conn,
+            h3_conn: None,
+            addr: *addr,
+            id,
+            in_flight_queries: HashMap::new(),
+            pending_answers: Vec::new(),
+        }
     }
 
     fn create_http3_connection(&mut self) -> Result<()> {
@@ -135,8 +146,23 @@ impl Client {
         info!("Preparing HTTP/3 response {:?} on stream {}", headers, stream_id);
 
         h3_conn.send_response(&mut self.conn, stream_id, &headers, false)?;
-        h3_conn.send_body(&mut self.conn, stream_id, response, true)?;
 
+        // In order to simulate the case that server send multiple packets for a DNS answer,
+        // only send half of the answer here. The remaining one will be cached here and then
+        // processed later in process_pending_answers().
+        let (first, second) = response.split_at(len / 2);
+        h3_conn.send_body(&mut self.conn, stream_id, first, false)?;
+        self.pending_answers.push((stream_id, second.to_vec()));
+
+        Ok(())
+    }
+
+    pub fn process_pending_answers(&mut self) -> Result<()> {
+        if let Some((stream_id, ans)) = self.pending_answers.pop() {
+            let h3_conn = self.h3_conn.as_mut().unwrap();
+            info!("process the remaining response for stream {}", stream_id);
+            h3_conn.send_body(&mut self.conn, stream_id, &ans, true)?;
+        }
         Ok(())
     }
 
@@ -144,16 +170,16 @@ impl Client {
     pub fn flush_egress(&mut self) -> Result<Vec<u8>> {
         let mut ret = vec![];
         let mut buf = [0; MAX_UDP_PAYLOAD_SIZE];
-        loop {
-            let (write, _) = match self.conn.send(&mut buf) {
-                Ok(v) => v,
-                Err(quiche::Error::Done) => break,
 
-                // Maybe close the connection?
-                Err(e) => bail!(e),
-            };
-            ret.append(&mut buf[..write].to_vec());
-        }
+        let (write, _) = match self.conn.send(&mut buf) {
+            Ok(v) => v,
+            Err(quiche::Error::Done) => bail!(quiche::Error::Done),
+            Err(e) => {
+                error!("flush_egress failed: {}", e);
+                bail!(e)
+            }
+        };
+        ret.append(&mut buf[..write].to_vec());
 
         Ok(ret)
     }
@@ -195,6 +221,10 @@ impl Client {
 
     pub fn on_timeout(&mut self) {
         self.conn.on_timeout();
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.conn.is_established() && !self.conn.is_closed()
     }
 }
 
@@ -256,8 +286,16 @@ impl ClientMap {
         self.clients.get_mut(&id.to_vec())
     }
 
-    pub fn get_mut_iter(&mut self) -> hash_map::IterMut<ConnectionID, Client> {
+    pub fn iter_mut(&mut self) -> hash_map::IterMut<ConnectionID, Client> {
         self.clients.iter_mut()
+    }
+
+    pub fn iter(&mut self) -> hash_map::Iter<ConnectionID, Client> {
+        self.clients.iter()
+    }
+
+    pub fn len(&mut self) -> usize {
+        self.clients.len()
     }
 }
 

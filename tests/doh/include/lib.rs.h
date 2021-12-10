@@ -17,11 +17,22 @@ static const uintptr_t DNS_HEADER_SIZE = 12;
 
 static const uintptr_t MAX_UDP_PAYLOAD_SIZE = 1350;
 
+/// Default value for max_idle_timeout transport parameter.
+static const uint64_t QUICHE_IDLE_TIMEOUT_MS = 10000;
+
+/// Default value for initial_max_streams_bidi transport parameter.
+static const uint64_t MAX_STREAMS_BIDI = 100;
+
 /// Frontend object.
 struct DohFrontend;
 
 struct Stats {
+    /// The number of accumulated DoH queries that are received.
     uint32_t queries_received;
+    /// The number of accumulated QUIC connections accepted.
+    uint32_t connections_accepted;
+    /// The number of QUIC connections alive.
+    uint32_t alive_connections;
 };
 
 extern "C" {
@@ -72,8 +83,25 @@ bool frontend_set_private_key(DohFrontend *doh, const char *private_key);
 /// are received. This function works even in the middle of the worker thread.
 bool frontend_set_delay_queries(DohFrontend *doh, int32_t count);
 
+/// Configures the `DohFrontend` to use the given value for max_idle_timeout transport parameter.
+bool frontend_set_max_idle_timeout(DohFrontend *doh, uint64_t value);
+
+/// Configures the `DohFrontend` to use the given value for these transport parameters.
+/// - initial_max_data
+/// - initial_max_stream_data_bidi_local
+/// - initial_max_stream_data_bidi_remote
+/// - initial_max_stream_data_uni
+bool frontend_set_max_buffer_size(DohFrontend *doh, uint64_t value);
+
+/// Configures the `DohFrontend` to use the given value for initial_max_streams_bidi transport
+/// parameter.
+bool frontend_set_max_streams_bidi(DohFrontend *doh, uint64_t value);
+
+/// Sets the `DohFrontend` to block or unblock sending any data.
+bool frontend_block_sending(DohFrontend *doh, bool block);
+
 /// Gets the statistics of the `DohFrontend` and writes the result to |out|.
-void frontend_stats(const DohFrontend *doh, Stats *out);
+bool frontend_stats(DohFrontend *doh, Stats *out);
 
 /// Resets `queries_received` field of `Stats` owned by the `DohFrontend`.
 bool frontend_stats_clear_queries(const DohFrontend *doh);

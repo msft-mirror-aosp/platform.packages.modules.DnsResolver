@@ -18,13 +18,21 @@
 
 #define LOG_TAG "DohFrontend"
 
+#include <thread>
+
+#include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <gtest/gtest.h>
 
 #include "dns_tls_certificate.h"
 
+using std::chrono::milliseconds;
+
 namespace test {
+
+constexpr milliseconds kEventTimeoutMs{5000};
+constexpr milliseconds kRetryIntervalMs{20};
 
 DohFrontend::~DohFrontend() {
     if (mRustDoh) {
@@ -67,11 +75,70 @@ int DohFrontend::queries() const {
     return stats.queries_received;
 }
 
+int DohFrontend::connections() const {
+    std::lock_guard guard(mMutex);
+    if (!mRustDoh) return 0;
+
+    rust::Stats stats;
+    rust::frontend_stats(mRustDoh, &stats);
+    return stats.connections_accepted;
+}
+
+int DohFrontend::aliveConnections() const {
+    std::lock_guard guard(mMutex);
+    if (!mRustDoh) return 0;
+
+    rust::Stats stats;
+    rust::frontend_stats(mRustDoh, &stats);
+    return stats.alive_connections;
+}
+
 void DohFrontend::clearQueries() {
     std::lock_guard guard(mMutex);
     if (mRustDoh) {
         frontend_stats_clear_queries(mRustDoh);
     }
+}
+
+bool DohFrontend::setMaxIdleTimeout(uint64_t value) {
+    std::lock_guard guard(mMutex);
+    if (!mRustDoh) return false;
+
+    frontend_set_max_idle_timeout(mRustDoh, value);
+    return true;
+}
+
+bool DohFrontend::setMaxBufferSize(uint64_t value) {
+    std::lock_guard guard(mMutex);
+    if (!mRustDoh) return false;
+
+    frontend_set_max_buffer_size(mRustDoh, value);
+    return true;
+}
+
+bool DohFrontend::setMaxStreamsBidi(uint64_t value) {
+    std::lock_guard guard(mMutex);
+    if (!mRustDoh) return false;
+
+    frontend_set_max_streams_bidi(mRustDoh, value);
+    return true;
+}
+
+bool DohFrontend::block_sending(bool block) {
+    std::lock_guard guard(mMutex);
+    if (!mRustDoh) return false;
+
+    frontend_block_sending(mRustDoh, block);
+    return true;
+}
+
+bool DohFrontend::waitForAllClientsDisconnected() const {
+    android::base::Timer t;
+    while (t.duration() < kEventTimeoutMs) {
+        if (aliveConnections() == 0) return true;
+        std::this_thread::sleep_for(kRetryIntervalMs);
+    }
+    return false;
 }
 
 }  // namespace test

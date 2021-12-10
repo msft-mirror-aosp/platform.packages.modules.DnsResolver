@@ -20,34 +20,34 @@
 
 #pragma once
 
-/* Generated with cbindgen:0.17.0 */
+/* Generated with cbindgen:0.20.0 */
 
 #include <stdint.h>
 #include <sys/types.h>
 
 /// The return code of doh_query means that there is no answer.
-static const ssize_t RESULT_INTERNAL_ERROR = -1;
+static const ssize_t DOH_RESULT_INTERNAL_ERROR = -1;
 
 /// The return code of doh_query means that query can't be sent.
-static const ssize_t RESULT_CAN_NOT_SEND = -2;
+static const ssize_t DOH_RESULT_CAN_NOT_SEND = -2;
 
 /// The return code of doh_query to indicate that the query timed out.
-static const ssize_t RESULT_TIMEOUT = -255;
+static const ssize_t DOH_RESULT_TIMEOUT = -255;
 
 /// The error log level.
-static const uint32_t LOG_LEVEL_ERROR = 0;
+static const uint32_t DOH_LOG_LEVEL_ERROR = 0;
 
 /// The warning log level.
-static const uint32_t LOG_LEVEL_WARN = 1;
+static const uint32_t DOH_LOG_LEVEL_WARN = 1;
 
 /// The info log level.
-static const uint32_t LOG_LEVEL_INFO = 2;
+static const uint32_t DOH_LOG_LEVEL_INFO = 2;
 
 /// The debug log level.
-static const uint32_t LOG_LEVEL_DEBUG = 3;
+static const uint32_t DOH_LOG_LEVEL_DEBUG = 3;
 
 /// The trace log level.
-static const uint32_t LOG_LEVEL_TRACE = 4;
+static const uint32_t DOH_LOG_LEVEL_TRACE = 4;
 
 /// Context for a running DoH engine.
 struct DohDispatcher;
@@ -55,17 +55,23 @@ struct DohDispatcher;
 using ValidationCallback = void (*)(uint32_t net_id, bool success, const char* ip_addr,
                                     const char* host);
 
+using TagSocketCallback = void (*)(int32_t sock);
+
 extern "C" {
 
 /// Performs static initialization for android logger.
+/// If an invalid level is passed, defaults to logging errors only.
+/// If called more than once, it will have no effect on subsequent calls.
 void doh_init_logger(uint32_t level);
 
 /// Set the log level.
+/// If an invalid level is passed, defaults to logging errors only.
 void doh_set_log_level(uint32_t level);
 
 /// Performs the initialization for the DoH engine.
 /// Creates and returns a DoH engine instance.
-DohDispatcher* doh_dispatcher_new(ValidationCallback ptr);
+DohDispatcher* doh_dispatcher_new(ValidationCallback validation_fn,
+                                  TagSocketCallback tag_socket_fn);
 
 /// Deletes a DoH engine created by doh_dispatcher_new().
 /// # Safety
@@ -81,7 +87,7 @@ void doh_dispatcher_delete(DohDispatcher* doh);
 /// `url`, `domain`, `ip_addr`, `cert_path` are null terminated strings.
 int32_t doh_net_new(DohDispatcher* doh, uint32_t net_id, const char* url, const char* domain,
                     const char* ip_addr, uint32_t sk_mark, const char* cert_path,
-                    uint64_t timeout_ms);
+                    uint64_t probe_timeout_ms, uint64_t idle_timeout_ms);
 
 /// Sends a DNS query via the network associated to the given |net_id| and waits for the response.
 /// The return code should be either one of the public constant RESULT_* to indicate the error or
