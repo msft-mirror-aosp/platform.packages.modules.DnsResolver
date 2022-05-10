@@ -31,6 +31,7 @@
 #include "gethnamaddr.h"
 #include "resolv_cache.h"
 #include "stats.pb.h"
+#include "tests/resolv_test_base.h"
 #include "tests/resolv_test_utils.h"
 
 #define NAME(variable) #variable
@@ -49,7 +50,7 @@ constexpr unsigned int MAXPACKET = 8 * 1024;
 // that any type or protocol can be returned by getaddrinfo().
 constexpr unsigned int ANY = 0;
 
-class TestBase : public ::testing::Test {
+class TestBase : public ResolvTestBase {
   protected:
     struct DnsMessage {
         std::string host_name;   // host name
@@ -129,66 +130,6 @@ class TestBase : public ::testing::Test {
 
     int SetResolvers(std::vector<std::string> servers) {
         return resolv_set_nameservers(TEST_NETID, servers, domains, params, std::nullopt);
-    }
-
-    int WaitChild(pid_t pid) {
-        int status;
-        const pid_t got_pid = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
-
-        if (got_pid != pid) {
-            PLOG(WARNING) << __func__ << ": waitpid failed: wanted " << pid << ", got " << got_pid;
-            return 1;
-        }
-
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-            return 0;
-        } else {
-            return status;
-        }
-    }
-
-    int ForkAndRun(const std::vector<std::string>& args) {
-        std::vector<const char*> argv;
-        argv.resize(args.size() + 1, nullptr);
-        std::transform(args.begin(), args.end(), argv.begin(),
-                       [](const std::string& in) { return in.c_str(); });
-
-        pid_t pid = fork();
-        if (pid == -1) {
-            // Fork failed.
-            PLOG(ERROR) << __func__ << ": Unable to fork";
-            return -1;
-        }
-
-        if (pid == 0) {
-            execv(argv[0], const_cast<char**>(argv.data()));
-            PLOG(ERROR) << __func__ << ": execv failed";
-            _exit(1);
-        }
-
-        int rc = WaitChild(pid);
-        if (rc != 0) {
-            PLOG(ERROR) << __func__ << ": Failed run: status=" << rc;
-        }
-        return rc;
-    }
-
-    // Add routing rules for MDNS packets, or MDNS packets won't know the destination is MDNS
-    // muticast address "224.0.0.251".
-    void SetMdnsRoute() {
-        const std::vector<std::string> args = {
-                "system/bin/ip", "route",  "add",   "local", "224.0.0.251", "dev",       "lo",
-                "proto",         "static", "scope", "host",  "src",         "127.0.0.1",
-        };
-        EXPECT_EQ(0, ForkAndRun(args));
-    }
-
-    void RemoveMdnsRoute() {
-        const std::vector<std::string> args = {
-                "system/bin/ip", "route",  "del",   "local", "224.0.0.251", "dev",       "lo",
-                "proto",         "static", "scope", "host",  "src",         "127.0.0.1",
-        };
-        EXPECT_EQ(0, ForkAndRun(args));
     }
 
     const android_net_context mNetcontext = {
@@ -1097,6 +1038,9 @@ TEST_F(ResolvGetAddrInfoTest, MdnsResponderTimeout) {
     ASSERT_TRUE(mdnsv4.startServer());
     ASSERT_TRUE(mdnsv6.startServer());
     ASSERT_EQ(0, SetResolvers());
+    test::DNSResponder dns("127.0.0.3", test::kDefaultListenService, static_cast<ns_rcode>(-1));
+    dns.setResponseProbability(0.0);
+    ASSERT_TRUE(dns.startServer());
 
     for (const auto& family : {AF_INET, AF_INET6, AF_UNSPEC}) {
         SCOPED_TRACE(fmt::format("family: {}, host_name: {}", family, host_name));
@@ -1885,6 +1829,9 @@ TEST_F(GetHostByNameForNetContextTest, MdnsResponderTimeout) {
     ASSERT_TRUE(mdnsv4.startServer());
     ASSERT_TRUE(mdnsv6.startServer());
     ASSERT_EQ(0, SetResolvers());
+    test::DNSResponder dns("127.0.0.3", test::kDefaultListenService, static_cast<ns_rcode>(-1));
+    dns.setResponseProbability(0.0);
+    ASSERT_TRUE(dns.startServer());
 
     for (const auto& family : {AF_INET, AF_INET6}) {
         SCOPED_TRACE(fmt::format("family: {}, host_name: {}", family, host_name));

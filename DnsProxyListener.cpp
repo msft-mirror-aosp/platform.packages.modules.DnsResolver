@@ -63,7 +63,6 @@
 using aidl::android::net::metrics::INetdEventListener;
 using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
 using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
-using android::net::NetworkDnsEventReported;
 using std::span;
 
 namespace android {
@@ -333,10 +332,11 @@ void maybeLogQuery(int eventType, const android_net_context& netContext,
 void reportDnsEvent(int eventType, const android_net_context& netContext, int latencyUs,
                     int returnCode, NetworkDnsEventReported& event, const std::string& query_name,
                     const std::vector<std::string>& ip_addrs = {}, int total_ip_addr_count = 0) {
-    uint32_t rate = (query_name.ends_with(".local") &&
-                     android::net::Experiments::getInstance()->getFlag("mdns_resolution", 1))
-                            ? getDnsEventSubsamplingRate(netContext.dns_netid, returnCode, true)
-                            : getDnsEventSubsamplingRate(netContext.dns_netid, returnCode, false);
+    uint32_t rate =
+            (query_name.ends_with(".local") && is_mdns_supported_network(netContext.dns_netid) &&
+             android::net::Experiments::getInstance()->getFlag("mdns_resolution", 1))
+                    ? getDnsEventSubsamplingRate(netContext.dns_netid, returnCode, true)
+                    : getDnsEventSubsamplingRate(netContext.dns_netid, returnCode, false);
 
     if (rate) {
         const std::string& dnsQueryStats = event.dns_query_events().SerializeAsString();
@@ -727,9 +727,9 @@ void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinf
 }
 
 void DnsProxyListener::GetAddrInfoHandler::run() {
-    LOG(DEBUG) << "GetAddrInfoHandler::run: {" << mNetContext.app_netid << " "
-               << mNetContext.app_mark << " " << mNetContext.dns_netid << " "
-               << mNetContext.dns_mark << " " << mNetContext.uid << " " << mNetContext.flags << "}";
+    LOG(INFO) << "GetAddrInfoHandler::run: {" << mNetContext.app_netid << " "
+              << mNetContext.app_mark << " " << mNetContext.dns_netid << " " << mNetContext.dns_mark
+              << " " << mNetContext.uid << " " << mNetContext.flags << "}";
 
     addrinfo* result = nullptr;
     Stopwatch s;
@@ -902,9 +902,9 @@ DnsProxyListener::ResNSendHandler::ResNSendHandler(SocketClient* c, std::string 
     : Handler(c), mMsg(std::move(msg)), mFlags(flags), mNetContext(netcontext) {}
 
 void DnsProxyListener::ResNSendHandler::run() {
-    LOG(DEBUG) << "ResNSendHandler::run: " << mFlags << " / {" << mNetContext.app_netid << " "
-               << mNetContext.app_mark << " " << mNetContext.dns_netid << " "
-               << mNetContext.dns_mark << " " << mNetContext.uid << " " << mNetContext.flags << "}";
+    LOG(INFO) << "ResNSendHandler::run: " << mFlags << " / {" << mNetContext.app_netid << " "
+              << mNetContext.app_mark << " " << mNetContext.dns_netid << " " << mNetContext.dns_mark
+              << " " << mNetContext.uid << " " << mNetContext.flags << "}";
 
     Stopwatch s;
     maybeFixupNetContext(&mNetContext, mClient->getPid());
@@ -1159,7 +1159,9 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     event.set_latency_micros(latencyUs);
     event.set_event_type(EVENT_GETHOSTBYNAME);
 
-    LOG(DEBUG) << "GetHostByNameHandler::run: result: " << gai_strerror(rv);
+    if (rv) {
+        LOG(DEBUG) << "GetHostByNameHandler::run: result failed: " << gai_strerror(rv);
+    }
 
     bool success = true;
     if (hp) {
@@ -1314,7 +1316,9 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     event.set_latency_micros(latencyUs);
     event.set_event_type(EVENT_GETHOSTBYADDR);
 
-    LOG(DEBUG) << "GetHostByAddrHandler::run: result: " << gai_strerror(rv);
+    if (rv) {
+        LOG(DEBUG) << "GetHostByAddrHandler::run: result failed: " << gai_strerror(rv);
+    }
 
     bool success = true;
     if (hp) {

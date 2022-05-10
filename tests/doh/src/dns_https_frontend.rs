@@ -21,7 +21,7 @@ use crate::config::{Config, QUICHE_IDLE_TIMEOUT_MS};
 use crate::stats::Stats;
 use anyhow::{bail, ensure, Result};
 use lazy_static::lazy_static;
-use log::{debug, error};
+use log::{debug, error, warn};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -55,6 +55,7 @@ enum InternalCommand {
 enum ControlCommand {
     Stats { resp: oneshot::Sender<Stats> },
     StatsClearQueries,
+    CloseConnection,
 }
 
 /// Frontend object.
@@ -132,9 +133,15 @@ impl DohFrontend {
     }
 
     pub fn stop(&mut self) -> Result<()> {
+        debug!("DohFrontend: stopping: {:?}", self);
         if let Some(worker_thread) = self.worker_thread.take() {
             // Update latest_stats before stopping worker_thread.
             let _ = self.request_stats();
+
+            self.command_tx.as_ref().unwrap().send(ControlCommand::CloseConnection)?;
+            if let Err(e) = self.wait_for_connections_closed() {
+                warn!("wait_for_connections_closed failed: {}", e);
+            }
 
             worker_thread.abort();
         }
@@ -226,7 +233,7 @@ impl DohFrontend {
         backend_socket.connect(self.backend_socket_addr)?;
         backend_socket.set_nonblocking(true)?;
 
-        let frontend_socket = std::net::UdpSocket::bind(self.listen_socket_addr)?;
+        let frontend_socket = bind_udp_socket_retry(self.listen_socket_addr)?;
         frontend_socket.set_nonblocking(true)?;
 
         let clients = ClientMap::new(create_quiche_config(
@@ -245,6 +252,20 @@ impl DohFrontend {
             config: self.config.clone(),
             command_rx,
         })
+    }
+
+    fn wait_for_connections_closed(&mut self) -> Result<()> {
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(50));
+            match self.request_stats() {
+                Ok(stats) if stats.alive_connections == 0 => return Ok(()),
+                Ok(_) => (),
+
+                // The worker thread is down. No connection is alive.
+                Err(_) => return Ok(()),
+            }
+        }
+        bail!("Some connections still alive")
     }
 }
 
@@ -380,6 +401,12 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                         }
                     }
                     ControlCommand::StatsClearQueries => queries_received = 0,
+                    ControlCommand::CloseConnection => {
+                        for (_, client) in clients.iter_mut() {
+                            client.close();
+                            event_tx.send(InternalCommand::MaybeWrite { connection_id: client.connection_id().clone() })?;
+                        }
+                    }
                 }
             }
         }
@@ -445,4 +472,19 @@ fn build_pipe() -> Result<(File, File)> {
         }
     }
     Err(anyhow::Error::new(std::io::Error::last_os_error()).context("build_pipe failed"))
+}
+
+// Can retry to bind the socket address if it is in use.
+fn bind_udp_socket_retry(addr: std::net::SocketAddr) -> Result<std::net::UdpSocket> {
+    for _ in 0..3 {
+        match std::net::UdpSocket::bind(addr) {
+            Ok(socket) => return Ok(socket),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                warn!("Binding socket address {} that is in use. Try again", addr);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        }
+    }
+    Err(anyhow::anyhow!(std::io::Error::last_os_error()))
 }

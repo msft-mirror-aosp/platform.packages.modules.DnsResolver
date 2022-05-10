@@ -34,6 +34,7 @@
 #include "tests/dns_responder/dns_responder.h"
 #include "tests/dns_responder/dns_responder_client_ndk.h"
 #include "tests/dns_responder/dns_tls_frontend.h"
+#include "tests/resolv_test_base.h"
 #include "tests/resolv_test_utils.h"
 #include "tests/unsolicited_listener/unsolicited_event_listener.h"
 
@@ -51,11 +52,14 @@ using android::netdutils::IPSockAddr;
 using android::netdutils::ScopedAddrinfo;
 using android::netdutils::Stopwatch;
 using std::chrono::milliseconds;
+using std::this_thread::sleep_for;
 
 const std::string kDohFlag("persist.device_config.netd_native.doh");
 const std::string kDohQueryTimeoutFlag("persist.device_config.netd_native.doh_query_timeout_ms");
 const std::string kDohProbeTimeoutFlag("persist.device_config.netd_native.doh_probe_timeout_ms");
 const std::string kDohIdleTimeoutFlag("persist.device_config.netd_native.doh_idle_timeout_ms");
+const std::string kDohSessionResumptionFlag(
+        "persist.device_config.netd_native.doh_session_resumption");
 
 constexpr int MAXPACKET = (8 * 1024);
 
@@ -143,7 +147,7 @@ void expectAnswersValid(int fd, int ipType, const std::string& expectedAnswer) {
 
 // Base class to deal with netd binder service and resolver binder service.
 // TODO: derive ResolverTest from this base class.
-class BaseTest : public ::testing::Test {
+class BaseTest : public ResolvTestBase {
   public:
     static void SetUpTestSuite() {
         // Get binder service.
@@ -217,7 +221,7 @@ class BaseTest : public ::testing::Test {
     }
 
     bool hasUncaughtPrivateDnsValidation(const std::string& serverAddr) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        sleep_for(milliseconds(200));
         return sUnsolicitedEventListener->findValidationRecord(
                        serverAddr, IDnsResolverUnsolicitedEventListener::PROTOCOL_DOT) ||
                sUnsolicitedEventListener->findValidationRecord(
@@ -304,9 +308,9 @@ class BasePrivateDnsTest : public BaseTest {
         BaseTest::TearDown();
     }
 
-    void sendQueryAndCheckResult() {
+    void sendQueryAndCheckResult(const char* host_name = kQueryHostname) {
         const addrinfo hints = {.ai_socktype = SOCK_DGRAM};
-        ScopedAddrinfo result = safe_getaddrinfo(kQueryHostname, nullptr, &hints);
+        ScopedAddrinfo result = safe_getaddrinfo(host_name, nullptr, &hints);
         EXPECT_THAT(ToStrings(result),
                     testing::ElementsAreArray({kQueryAnswerAAAA, kQueryAnswerA}));
     };
@@ -377,6 +381,12 @@ class TransportParameterizedTest : public BasePrivateDnsTest,
             ASSERT_TRUE(doh_backend.startServer());
             ASSERT_TRUE(doh.startServer());
         }
+        SetMdnsRoute();
+    }
+
+    void TearDown() override {
+        RemoveMdnsRoute();
+        BasePrivateDnsTest::TearDown();
     }
 
     bool testParamHasDot() { return GetParam() & kDotBit; }
@@ -427,6 +437,75 @@ TEST_P(TransportParameterizedTest, GetAddrInfo) {
     doh.stopServer();
 
     EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+    if (testParamHasDoh()) {
+        EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 0 /* dot */, 2 /* doh */));
+    } else {
+        EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 2 /* dot */, 0 /* doh */));
+    }
+}
+
+TEST_P(TransportParameterizedTest, MdnsGetAddrInfo_fallback) {
+    constexpr char host_name[] = "hello.local.";
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService,
+                              static_cast<ns_rcode>(-1));
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService, static_cast<ns_rcode>(-1));
+    // Set unresponsive on multicast.
+    mdnsv4.setResponseProbability(0.0);
+    mdnsv6.setResponseProbability(0.0);
+    ASSERT_TRUE(mdnsv4.startServer());
+    ASSERT_TRUE(mdnsv6.startServer());
+
+    const std::vector<DnsRecord> records = {
+            {host_name, ns_type::ns_t_a, kQueryAnswerA},
+            {host_name, ns_type::ns_t_aaaa, kQueryAnswerAAAA},
+    };
+
+    for (const auto& r : records) {
+        dns.addMapping(r.host_name, r.type, r.addr);
+        dot_backend.addMapping(r.host_name, r.type, r.addr);
+        doh_backend.addMapping(r.host_name, r.type, r.addr);
+    }
+
+    auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    if (testParamHasDoh()) EXPECT_TRUE(WaitForDohValidation(test::kDefaultListenAddr, true));
+    if (testParamHasDot()) EXPECT_TRUE(WaitForDotValidation(test::kDefaultListenAddr, true));
+
+    // This waiting time is expected to avoid that the DoH validation event interferes other tests.
+    if (!testParamHasDoh()) waitForDohValidationFailed();
+
+    // Have the test independent of the number of sent queries in private DNS validation, because
+    // the DnsResolver can send either 1 or 2 queries in DoT validation.
+    if (testParamHasDoh()) {
+        doh.clearQueries();
+    }
+    if (testParamHasDot()) {
+        EXPECT_TRUE(dot.waitForQueries(1));
+        dot.clearQueries();
+    }
+    dns.clearQueries();
+
+    EXPECT_NO_FAILURE(sendQueryAndCheckResult("hello.local"));
+    EXPECT_EQ(1U, GetNumQueries(mdnsv4, host_name));
+    EXPECT_EQ(1U, GetNumQueries(mdnsv6, host_name));
+    if (testParamHasDoh()) {
+        EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
+    } else {
+        EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 2 /* dot */, 0 /* doh */));
+    }
+
+    // Stop the private DNS servers. Since we are in opportunistic mode, queries will
+    // fall back to the cleartext nameserver.
+    flushCache();
+    dot.stopServer();
+    doh.stopServer();
+    mdnsv4.clearQueries();
+    mdnsv6.clearQueries();
+
+    EXPECT_NO_FAILURE(sendQueryAndCheckResult("hello.local"));
+    EXPECT_EQ(1U, GetNumQueries(mdnsv4, host_name));
+    EXPECT_EQ(1U, GetNumQueries(mdnsv6, host_name));
     if (testParamHasDoh()) {
         EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 0 /* dot */, 2 /* doh */));
     } else {
@@ -690,7 +769,7 @@ TEST_F(PrivateDnsDohTest, TemporaryConnectionStalled) {
     Stopwatch s;
     int fd = resNetworkQuery(TEST_NETID, kQueryHostname, ns_c_in, ns_t_a,
                              ANDROID_RESOLV_NO_CACHE_LOOKUP);
-    std::this_thread::sleep_for(std::chrono::milliseconds(connectionStalledTimeMs));
+    sleep_for(milliseconds(connectionStalledTimeMs));
     EXPECT_TRUE(doh.block_sending(false));
 
     expectAnswersValid(fd, AF_INET, kQueryAnswerA);
@@ -712,9 +791,6 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     const int initial_max_idle_timeout_ms = 2000;
     ASSERT_TRUE(doh.stopServer());
     EXPECT_TRUE(doh.setMaxIdleTimeout(initial_max_idle_timeout_ms));
-    // Sleep a while to avoid binding socket failed.
-    // TODO: Make DohFrontend retry binding sockets.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     ASSERT_TRUE(doh.startServer());
 
     auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
@@ -741,6 +817,7 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     for (const auto& fd : fds) {
         expectAnswersValid(fd, AF_INET6, kQueryAnswerAAAA);
     }
+    EXPECT_TRUE(doh.block_sending(false));
 
     // There are some queries that fall back to DoT rather than UDP since the DoH client rejects
     // any new DNS requests when the capacity is full.
@@ -767,7 +844,7 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
 
     // Sleep a while to wait for DoH and DoT validation.
     // TODO: Extend WaitForDohValidation() to support passing a netId.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    sleep_for(milliseconds(200));
     EXPECT_TRUE(dot_ipv6.waitForQueries(1));
 
     int fd = resNetworkQuery(TEST_NETID_2, kQueryHostname, ns_c_in, ns_t_aaaa,
@@ -777,6 +854,21 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     // Expect two queries: one for DoH probe and the other one for kQueryHostname.
     EXPECT_EQ(doh_ipv6.queries(), 2);
     mDnsClient.TearDownOemNetwork(TEST_NETID_2);
+
+    // The DnsResolver will reconnect to the DoH server for the query that gets blocked at
+    // dispatcher sending channel. However, there's no way to know when the reconnection will start.
+    // We have to periodically send a DNS request to check it. After the reconnection starts, the
+    // DNS query will be sent to the Doh server instead of the cleartext DNS server. Then, we
+    // are safe to end the test. Otherwise, the reconnection will interfere other tests.
+    EXPECT_EQ(doh.queries(), 0);
+    for (int i = 0; i < 50; i++) {
+        sleep_for(milliseconds(100));
+        int fd = resNetworkQuery(TEST_NETID, kQueryHostname, ns_c_in, ns_t_aaaa,
+                                 ANDROID_RESOLV_NO_CACHE_LOOKUP);
+        expectAnswersValid(fd, AF_INET6, kQueryAnswerAAAA);
+        if (doh.queries() > 0) break;
+    }
+    EXPECT_GT(doh.queries(), 0);
 }
 
 // Tests the scenario where the DnsResolver runs out of QUIC connection data limit.
@@ -791,9 +883,6 @@ TEST_F(PrivateDnsDohTest, RunOutOfDataLimit) {
 
     ASSERT_TRUE(doh.stopServer());
     EXPECT_TRUE(doh.setMaxBufferSize(initial_max_data));
-    // Sleep a while to avoid binding socket failed.
-    // TODO: Make DohFrontend retry binding sockets.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     ASSERT_TRUE(doh.startServer());
 
     const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
@@ -815,7 +904,7 @@ TEST_F(PrivateDnsDohTest, RunOutOfDataLimit) {
             expectAnswersValid(fd, AF_INET, kQueryAnswerA);
         });
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    sleep_for(milliseconds(500));
     EXPECT_TRUE(doh.block_sending(false));
 
     // In current implementation, the fifth DoH query will get blocked and result in timeout.
@@ -843,8 +932,6 @@ TEST_F(PrivateDnsDohTest, RunOutOfStreams) {
 
     ASSERT_TRUE(doh.stopServer());
     EXPECT_TRUE(doh.setMaxStreamsBidi(initial_max_streams_bidi));
-    // Sleep a while to avoid binding socket failed.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     ASSERT_TRUE(doh.startServer());
 
     const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
@@ -866,7 +953,7 @@ TEST_F(PrivateDnsDohTest, RunOutOfStreams) {
             expectAnswersValid(fd, AF_INET, kQueryAnswerA);
         });
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    sleep_for(milliseconds(500));
     EXPECT_TRUE(doh.block_sending(false));
 
     for (std::thread& thread : threads) {
@@ -883,8 +970,6 @@ TEST_F(PrivateDnsDohTest, ReconnectAfterIdleTimeout) {
 
     ASSERT_TRUE(doh.stopServer());
     EXPECT_TRUE(doh.setMaxIdleTimeout(initial_max_idle_timeout_ms));
-    // Sleep a while to avoid binding socket failed.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     ASSERT_TRUE(doh.startServer());
 
     const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
@@ -898,7 +983,7 @@ TEST_F(PrivateDnsDohTest, ReconnectAfterIdleTimeout) {
 
     for (int i = 0; i < 5; i++) {
         SCOPED_TRACE(fmt::format("Round: {}", i));
-        std::this_thread::sleep_for(std::chrono::milliseconds(initial_max_idle_timeout_ms + 500));
+        sleep_for(milliseconds(initial_max_idle_timeout_ms + 500));
 
         // As the connection is closed, the DnsResolver will reconnect to the DoH server
         // for this DNS request.
@@ -909,7 +994,6 @@ TEST_F(PrivateDnsDohTest, ReconnectAfterIdleTimeout) {
 
     EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 5 /* doh */));
     EXPECT_EQ(doh.connections(), 6);
-    EXPECT_EQ(doh.resumedConnections(), 5);
 }
 
 // Tests that the experiment flag doh_idle_timeout_ms is effective.
@@ -945,9 +1029,80 @@ TEST_F(PrivateDnsDohTest, ConnectionIdleTimer) {
     EXPECT_EQ(doh.connections(), 1);
 
     // Expect that the DoH connection gets disconnected while sleeping.
-    std::this_thread::sleep_for(std::chrono::milliseconds(connection_idle_timeout + tolerance_ms));
+    sleep_for(milliseconds(connection_idle_timeout + tolerance_ms));
 
     EXPECT_NO_FAILURE(sendQueryAndCheckResult());
     EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 4 /* doh */));
     EXPECT_EQ(doh.connections(), 2);
+}
+
+// Tests that the flag "doh_session_resumption" works as expected.
+TEST_F(PrivateDnsDohTest, SessionResumption) {
+    const int initial_max_idle_timeout_ms = 1000;
+    for (const auto& flag : {"0", "1"}) {
+        SCOPED_TRACE(fmt::format("flag: {}", flag));
+        auto sp = make_unique<ScopedSystemProperties>(kDohSessionResumptionFlag, flag);
+
+        // Each loop takes around 3 seconds, if the system property "doh" is reset in the middle
+        // of the first loop, this test will fail when running the second loop because DnsResolver
+        // updates its "doh" flag when resetNetwork() is called. Therefore, add another
+        // ScopedSystemProperties for "doh" to make the test more robust.
+        auto sp2 = make_unique<ScopedSystemProperties>(kDohFlag, "1");
+        resetNetwork();
+
+        ASSERT_TRUE(doh.stopServer());
+        EXPECT_TRUE(doh.setMaxIdleTimeout(initial_max_idle_timeout_ms));
+        ASSERT_TRUE(doh.startServer());
+
+        const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+        EXPECT_TRUE(WaitForDohValidation(test::kDefaultListenAddr, true));
+        EXPECT_TRUE(WaitForDotValidation(test::kDefaultListenAddr, true));
+        EXPECT_TRUE(dot.waitForQueries(1));
+        dot.clearQueries();
+        doh.clearQueries();
+        dns.clearQueries();
+
+        for (int i = 0; i < 2; i++) {
+            SCOPED_TRACE(fmt::format("Round: {}", i));
+            sleep_for(milliseconds(initial_max_idle_timeout_ms + 500));
+
+            // As the connection is closed, the DnsResolver will reconnect to the DoH server
+            // for this DNS request.
+            int fd = resNetworkQuery(TEST_NETID, kQueryHostname, ns_c_in, ns_t_a,
+                                     ANDROID_RESOLV_NO_CACHE_LOOKUP);
+            expectAnswersValid(fd, AF_INET, kQueryAnswerA);
+        }
+
+        EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
+        EXPECT_EQ(doh.connections(), 3);
+        EXPECT_EQ(doh.resumedConnections(), (flag == "1" ? 2 : 0));
+    }
+}
+
+// Tests that after the connection is closed by the server (known by sending CONNECTION_CLOSE
+// frame), the DnsResolver can initiate another new connection for DNS requests.
+TEST_F(PrivateDnsDohTest, RemoteConnectionClosed) {
+    const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+    EXPECT_TRUE(WaitForDohValidation(test::kDefaultListenAddr, true));
+    EXPECT_TRUE(WaitForDotValidation(test::kDefaultListenAddr, true));
+    EXPECT_TRUE(dot.waitForQueries(1));
+    dot.clearQueries();
+    doh.clearQueries();
+    dns.clearQueries();
+
+    EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+    EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
+    flushCache();
+    EXPECT_EQ(doh.connections(), 1);
+
+    // Make the server close the connection. This will also reset the stats, so the doh query
+    // count below is still 2 rather than 4.
+    ASSERT_TRUE(doh.stopServer());
+    ASSERT_TRUE(doh.startServer());
+
+    EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+    EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
+    EXPECT_EQ(doh.connections(), 1);
 }
