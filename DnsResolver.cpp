@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "resolv"
+
 #include "DnsResolver.h"
 
 #include <android-base/logging.h>
@@ -28,10 +30,10 @@
 
 bool resolv_init(const ResolverNetdCallbacks* callbacks) {
     android::base::InitLogging(/*argv=*/nullptr);
-    android::base::SetDefaultTag("libnetd_resolv");
     LOG(INFO) << __func__ << ": Initializing resolver";
-    // TODO(b/170539625): restore log level to WARNING after clarifying flaky tests.
-    resolv_set_log_severity(isUserDebugBuild() ? android::base::DEBUG : android::base::WARNING);
+    const bool isDebug = isUserDebugBuild();
+    resolv_set_log_severity(isDebug ? android::base::INFO : android::base::WARNING);
+    doh_init_logger(isDebug ? DOH_LOG_LEVEL_INFO : DOH_LOG_LEVEL_WARN);
     using android::net::gApiLevel;
     gApiLevel = getApiLevel();
     using android::net::gResNetdCallbacks;
@@ -81,6 +83,7 @@ DnsResolver::DnsResolver() {
     auto& dnsTlsDispatcher = DnsTlsDispatcher::getInstance();
     auto& privateDnsConfiguration = PrivateDnsConfiguration::getInstance();
     privateDnsConfiguration.setObserver(&dnsTlsDispatcher);
+    if (isDoHEnabled()) privateDnsConfiguration.initDoh();
 }
 
 bool DnsResolver::start() {
