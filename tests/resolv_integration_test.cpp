@@ -49,6 +49,7 @@
 #include <chrono>
 #include <iterator>
 #include <numeric>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 
@@ -777,6 +778,25 @@ TEST_F(ResolverTest, GetAddrInfo_localhost) {
     // Expect no DNS queries; ip6-localhost is resolved via /etc/hosts
     EXPECT_TRUE(dns.queries().empty()) << dns.dumpQueries();
     EXPECT_EQ(kIp6LocalHostAddr, ToString(result));
+}
+
+TEST_F(ResolverTest, GetAddrInfo_NumericHostname) {
+    // Add a no-op nameserver which shouldn't receive any queries
+    test::DNSResponder dns;
+    StartDns(dns, {});
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    ScopedAddrinfo result = safe_getaddrinfo("1.2.3.4", nullptr, nullptr);
+    EXPECT_TRUE(result != nullptr);
+    // Expect no DNS queries. Numeric hostname doesn't need to resolve.
+    EXPECT_TRUE(dns.queries().empty()) << dns.dumpQueries();
+    EXPECT_EQ("1.2.3.4", ToString(result));
+
+    result = safe_getaddrinfo("2001:db8::1", nullptr, nullptr);
+    EXPECT_TRUE(result != nullptr);
+    // Expect no DNS queries. Numeric hostname doesn't need to resolve.
+    EXPECT_TRUE(dns.queries().empty()) << dns.dumpQueries();
+    EXPECT_EQ("2001:db8::1", ToString(result));
 }
 
 TEST_F(ResolverTest, GetAddrInfo_InvalidSocketType) {
@@ -2907,6 +2927,11 @@ TEST_F(ResolverTest, BrokenEdns) {
         const std::string testHostName = config.asHostName();
         SCOPED_TRACE(testHostName);
 
+        // Don't skip unusable DoT servers and disable revalidation for this test.
+        ScopedSystemProperties sp1(kDotXportUnusableThresholdFlag, "-1");
+        ScopedSystemProperties sp2(kDotRevalidationThresholdFlag, "-1");
+        resetNetwork();
+
         const char* host_name = testHostName.c_str();
         dns.addMapping(host_name, ns_type::ns_t_a, ADDR4);
         dns.setEdns(config.edns);
@@ -3084,7 +3109,7 @@ TEST_F(ResolverTest, GetAddrInfo_Dns64Synthesize) {
     // Expect that there are two queries, one AAAA (which returns no records) and one A
     // (which returns 1.2.3.4).
     EXPECT_EQ(2U, GetNumQueries(dns, host_name));
-    EXPECT_EQ(ToString(result), "64:ff9b::102:304");
+    EXPECT_THAT(ToStrings(result), testing::ElementsAre("64:ff9b::102:304", "1.2.3.4"));
 
     // Stopping NAT64 prefix discovery disables synthesis.
     EXPECT_TRUE(mDnsClient.resolvService()->stopPrefix64Discovery(TEST_NETID).isOk());
@@ -3160,7 +3185,8 @@ TEST_F(ResolverTest, GetAddrInfo_Dns64SynthesizeMultiAnswers) {
 
     // Synthesize AAAA if there's no AAAA answer and AF_UNSPEC is specified.
     EXPECT_THAT(ToStrings(result),
-                testing::ElementsAre("64:ff9b::102:304", "64:ff9b::808:808", "64:ff9b::5175:15ca"));
+                testing::ElementsAre("64:ff9b::102:304", "64:ff9b::808:808", "64:ff9b::5175:15ca",
+                                     "1.2.3.4", "8.8.8.8", "81.117.21.202"));
 }
 
 TEST_F(ResolverTest, GetAddrInfo_Dns64Canonname) {
@@ -3193,10 +3219,10 @@ TEST_F(ResolverTest, GetAddrInfo_Dns64Canonname) {
             return fmt::format("family={}, flags={}", family, flags);
         }
     } testConfigs[]{
-        {AF_UNSPEC,            0, {"64:ff9b::102:304"}, nullptr},
-        {AF_UNSPEC, AI_CANONNAME, {"64:ff9b::102:304"}, "v4only.example.com"},
-        {AF_INET6,             0, {"64:ff9b::102:304"}, nullptr},
-        {AF_INET6,  AI_CANONNAME, {"64:ff9b::102:304"}, "v4only.example.com"},
+        {AF_UNSPEC,            0, {"64:ff9b::102:304", "1.2.3.4"}, nullptr},
+        {AF_UNSPEC, AI_CANONNAME, {"64:ff9b::102:304", "1.2.3.4"}, "v4only.example.com"},
+        {AF_INET6,             0, {"64:ff9b::102:304"}           , nullptr},
+        {AF_INET6,  AI_CANONNAME, {"64:ff9b::102:304"}           , "v4only.example.com"},
     };
     // clang-format on
 
@@ -3207,10 +3233,10 @@ TEST_F(ResolverTest, GetAddrInfo_Dns64Canonname) {
                 .ai_family = config.family, .ai_flags = config.flags, .ai_socktype = SOCK_DGRAM};
         ScopedAddrinfo result = safe_getaddrinfo("v4only", nullptr, &hints);
         ASSERT_TRUE(result != nullptr);
-        EXPECT_EQ(ToString(result), "64:ff9b::102:304");
-        const auto* ai = result.get();
-        ASSERT_TRUE(ai != nullptr);
-        EXPECT_STREQ(ai->ai_canonname, config.expectedCanonname);
+        EXPECT_THAT(ToStrings(result), testing::ElementsAreArray(config.expectedAddresses));
+        for (const auto* ai = result.get(); ai != nullptr; ai = ai->ai_next) {
+            EXPECT_STREQ(ai->ai_canonname, config.expectedCanonname);
+        }
     }
 }
 
@@ -3302,7 +3328,7 @@ TEST_F(ResolverTest, GetAddrInfo_Dns64QueryUnspecifiedNoV6) {
     EXPECT_EQ(2U, GetNumQueries(dns, host_name));
 
     // Synthesize AAAA if there's no AAAA answer and AF_UNSPEC is specified.
-    EXPECT_EQ(ToString(result), "64:ff9b::102:304");
+    EXPECT_THAT(ToStrings(result), testing::ElementsAre("64:ff9b::102:304", "1.2.3.4"));
 }
 
 TEST_F(ResolverTest, GetAddrInfo_Dns64QuerySpecialUseIPv4Addresses) {
@@ -3401,7 +3427,8 @@ TEST_F(ResolverTest, GetAddrInfo_Dns64QueryWithNullArgumentHints) {
     ScopedAddrinfo result = safe_getaddrinfo("v4only", nullptr, nullptr);
     EXPECT_TRUE(result != nullptr);
     EXPECT_LE(2U, GetNumQueries(dns, host_name));
-    EXPECT_EQ(ToString(result), "64:ff9b::102:304");
+    EXPECT_THAT(ToStrings(result),
+                testing::ElementsAre("64:ff9b::102:304", "64:ff9b::102:304", "1.2.3.4", "1.2.3.4"));
     dns.clearQueries();
 
     // Do not synthesize AAAA if there's at least one AAAA answer.
@@ -4572,6 +4599,10 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout) {
 
         ScopedSystemProperties sp3(kDotAsyncHandshakeFlag, config.asyncHandshake ? "1" : "0");
         ScopedSystemProperties sp4(kDotMaxretriesFlag, std::to_string(config.maxRetries));
+
+        // Don't skip unusable DoT servers and disable revalidation for this test.
+        ScopedSystemProperties sp5(kDotXportUnusableThresholdFlag, "-1");
+        ScopedSystemProperties sp6(kDotRevalidationThresholdFlag, "-1");
         resetNetwork();
 
         // Set up resolver to opportunistic mode.
@@ -4662,9 +4693,13 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout_ConcurrentQueries) {
                                    std::to_string(config.dotConnectTimeoutMs));
         ScopedSystemProperties sp3(kDotAsyncHandshakeFlag, config.asyncHandshake ? "1" : "0");
         ScopedSystemProperties sp4(kDotMaxretriesFlag, std::to_string(config.maxRetries));
+
+        // Don't skip unusable DoT servers and disable revalidation for this test.
+        ScopedSystemProperties sp5(kDotXportUnusableThresholdFlag, "-1");
+        ScopedSystemProperties sp6(kDotRevalidationThresholdFlag, "-1");
         resetNetwork();
 
-        for (const auto& dnsMode : {"OPPORTUNISTIC", "STRICT"}) {
+        for (const std::string_view dnsMode : {"OPPORTUNISTIC", "STRICT"}) {
             SCOPED_TRACE(fmt::format("testConfig: [{}, {}]", testConfigCount, dnsMode));
 
             // Because a DnsTlsTransport lasts at least 5 minutes in spite of network
@@ -4734,7 +4769,7 @@ TEST_F(ResolverTest, QueryTlsServerTimeout) {
     };
 
     for (const int queryTimeoutMs : {INFINITE_QUERY_TIMEOUT, 1000}) {
-        for (const auto& dnsMode : {"OPPORTUNISTIC", "STRICT"}) {
+        for (const std::string_view dnsMode : {"OPPORTUNISTIC", "STRICT"}) {
             SCOPED_TRACE(fmt::format("testConfig: [{}] [{}]", dnsMode, queryTimeoutMs));
 
             const std::string addr = getUniqueIPv4Address();
@@ -4744,6 +4779,10 @@ TEST_F(ResolverTest, QueryTlsServerTimeout) {
             ASSERT_TRUE(tls.startServer());
 
             ScopedSystemProperties sp(kDotQueryTimeoutMsFlag, std::to_string(queryTimeoutMs));
+
+            // Don't skip unusable DoT servers and disable revalidation for this test.
+            ScopedSystemProperties sp2(kDotXportUnusableThresholdFlag, "-1");
+            ScopedSystemProperties sp3(kDotRevalidationThresholdFlag, "-1");
             resetNetwork();
 
             auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
@@ -4787,8 +4826,86 @@ TEST_F(ResolverTest, QueryTlsServerTimeout) {
             // Also check how much time the resolver processed the query.
             timeTakenMs = s.timeTakenUs() / 1000;
             EXPECT_LE(timeTakenMs, 500);
-            EXPECT_EQ(2, tls.queries());
+            EXPECT_TRUE(tls.waitForQueries(2));
         }
+    }
+}
+
+// Tests that the DnsResolver can skip using unusable DoT servers if dot_xport_unusable_threshold
+// flag is set. In this test, we make test DoT servers unresponsive during connection handshake,
+// so the DnsResolver will skip using a DoT server if the number of timed out queries reaches
+// the threshold.
+TEST_F(ResolverTest, SkipUnusableTlsServer) {
+    constexpr int DOT_CONNECT_TIMEOUT_MS = 1000;
+
+    static const struct TestConfig {
+        int dotXportUnusableThreshold;
+        int queries;
+        int expectedQueriesSentToDot1;
+        int expectedQueriesSentToDot2;
+    } testConfigs[] = {
+            // clang-format off
+            // expectedQueriesSentToDot2 is 0 because dot_quick_fallback flag is set.
+            {-1,  3, 3, 0},
+            { 1,  3, 1, 1},
+            { 3, 10, 3, 3},
+            // clang-format on
+    };
+
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(fmt::format("testConfig: [{}, {}, {}, {}]", config.dotXportUnusableThreshold,
+                                 config.queries, config.expectedQueriesSentToDot1,
+                                 config.expectedQueriesSentToDot2));
+
+        const std::string addr1 = getUniqueIPv4Address();
+        const std::string addr2 = getUniqueIPv4Address();
+        test::DNSResponder dns1(addr1);
+        test::DNSResponder dns2(addr2);
+        test::DnsTlsFrontend dot1(addr1, "853", addr1, "53");
+        test::DnsTlsFrontend dot2(addr2, "853", addr2, "53");
+        dns1.addMapping(kHelloExampleCom, ns_type::ns_t_aaaa, kHelloExampleComAddrV6);
+        dns2.addMapping(kHelloExampleCom, ns_type::ns_t_aaaa, kHelloExampleComAddrV6);
+        ASSERT_TRUE(dns1.startServer());
+        ASSERT_TRUE(dns2.startServer());
+        ASSERT_TRUE(dot1.startServer());
+        ASSERT_TRUE(dot2.startServer());
+
+        ScopedSystemProperties sp1(kDotConnectTimeoutMsFlag,
+                                   std::to_string(DOT_CONNECT_TIMEOUT_MS));
+        ScopedSystemProperties sp2(kDotXportUnusableThresholdFlag,
+                                   std::to_string(config.dotXportUnusableThreshold));
+        ScopedSystemProperties sp3(kDotQuickFallbackFlag, "1");
+        ScopedSystemProperties sp4(kDotRevalidationThresholdFlag, "-1");
+        resetNetwork();
+
+        // Private DNS opportunistic mode.
+        auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+        parcel.servers = {addr1, addr2};
+        parcel.tlsServers = {addr1, addr2};
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+        EXPECT_TRUE(WaitForPrivateDnsValidation(dot1.listen_address(), true));
+        EXPECT_TRUE(WaitForPrivateDnsValidation(dot2.listen_address(), true));
+        EXPECT_TRUE(dot1.waitForQueries(1));
+        EXPECT_TRUE(dot2.waitForQueries(1));
+        dot1.clearQueries();
+        dot2.clearQueries();
+        dot1.clearConnectionsCount();
+        dot2.clearConnectionsCount();
+
+        // Set the DoT servers as unresponsive to connection handshake.
+        dot1.setHangOnHandshakeForTesting(true);
+        dot2.setHangOnHandshakeForTesting(true);
+
+        // Send sequential queries
+        for (int i = 0; i < config.queries; i++) {
+            int fd = resNetworkQuery(TEST_NETID, kHelloExampleCom, ns_c_in, ns_t_aaaa,
+                                     ANDROID_RESOLV_NO_CACHE_LOOKUP);
+            expectAnswersValid(fd, AF_INET6, kHelloExampleComAddrV6);
+        }
+
+        EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1);
+        EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2);
     }
 }
 
@@ -4814,7 +4931,7 @@ TEST_F(ResolverTest, TlsServerRevalidation) {
     } testConfigs[] = {
             // clang-format off
             {"OPPORTUNISTIC", -1,  5, false, false},
-            {"OPPORTUNISTIC", -1, 10, false, false},
+            {"OPPORTUNISTIC", -1, 10, false,  true},
             {"OPPORTUNISTIC",  5,  5,  true, false},
             {"OPPORTUNISTIC",  5, 10,  true,  true},
             {"STRICT",        -1,  5, false, false},
@@ -5061,6 +5178,15 @@ TEST_F(ResolverTest, DotQuickFallback) {
                                    std::to_string(DOT_CONNECT_TIMEOUT_MS));
         ScopedSystemProperties sp2(kDotQuickFallbackFlag,
                                    std::to_string(config.dotQuickFallbackFlag));
+
+        // Disable revalidation because we are reusing the same IP address of DoT servers.
+        ScopedSystemProperties sp3(kDotRevalidationThresholdFlag, "-1");
+
+        // TODO: Remove the flags and fix the test.
+        ScopedSystemProperties sp4(kDotAsyncHandshakeFlag, "0");
+        ScopedSystemProperties sp5(kDotMaxretriesFlag, "3");
+        resetNetwork();
+
         resetNetwork();
 
         auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
@@ -5087,7 +5213,7 @@ TEST_F(ResolverTest, DotQuickFallback) {
 
         EXPECT_EQ(dot1.acceptConnectionsCount(), 1);
         EXPECT_EQ(dot2.acceptConnectionsCount(), canQuickFallback ? 0 : 1);
-        EXPECT_EQ(dot2.queries(), canQuickFallback ? 0 : 1);
+        EXPECT_TRUE(dot2.waitForQueries(canQuickFallback ? 0 : 1));
 
         dot1.setHangOnHandshakeForTesting(false);
     }

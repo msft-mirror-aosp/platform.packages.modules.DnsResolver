@@ -60,6 +60,8 @@ const std::string kDohProbeTimeoutFlag("persist.device_config.netd_native.doh_pr
 const std::string kDohIdleTimeoutFlag("persist.device_config.netd_native.doh_idle_timeout_ms");
 const std::string kDohSessionResumptionFlag(
         "persist.device_config.netd_native.doh_session_resumption");
+const std::string kDotAsyncHandshakeFlag("persist.device_config.netd_native.dot_async_handshake");
+const std::string kDotMaxretriesFlag("persist.device_config.netd_native.dot_maxtries");
 
 constexpr int MAXPACKET = (8 * 1024);
 
@@ -282,11 +284,11 @@ class BasePrivateDnsTest : public BaseTest {
 
   protected:
     void SetUp() override {
-        mDohScopedProp = make_unique<ScopedSystemProperties>(kDohFlag, "1");
+        mDohScopedProp = std::make_unique<ScopedSystemProperties>(kDohFlag, "1");
         mDohQueryTimeoutScopedProp =
-                make_unique<ScopedSystemProperties>(kDohQueryTimeoutFlag, "1000");
+                std::make_unique<ScopedSystemProperties>(kDohQueryTimeoutFlag, "1000");
         unsigned int expectedProbeTimeout = kExpectedDohValidationTimeWhenTimeout.count();
-        mDohProbeTimeoutScopedProp = make_unique<ScopedSystemProperties>(
+        mDohProbeTimeoutScopedProp = std::make_unique<ScopedSystemProperties>(
                 kDohProbeTimeoutFlag, std::to_string(expectedProbeTimeout));
         BaseTest::SetUp();
 
@@ -312,7 +314,7 @@ class BasePrivateDnsTest : public BaseTest {
         const addrinfo hints = {.ai_socktype = SOCK_DGRAM};
         ScopedAddrinfo result = safe_getaddrinfo(host_name, nullptr, &hints);
         EXPECT_THAT(ToStrings(result),
-                    testing::ElementsAreArray({kQueryAnswerAAAA, kQueryAnswerA}));
+                    testing::UnorderedElementsAreArray({kQueryAnswerAAAA, kQueryAnswerA}));
     };
 
     void expectQueries(int dnsQueries, int dotQueries, int dohQueries) {
@@ -403,6 +405,11 @@ INSTANTIATE_TEST_SUITE_P(PrivateDns, TransportParameterizedTest,
                          });
 
 TEST_P(TransportParameterizedTest, GetAddrInfo) {
+    // TODO: Remove the flags and fix the test.
+    ScopedSystemProperties sp1(kDotAsyncHandshakeFlag, "0");
+    ScopedSystemProperties sp2(kDotMaxretriesFlag, "3");
+    resetNetwork();
+
     const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
 
@@ -445,6 +452,11 @@ TEST_P(TransportParameterizedTest, GetAddrInfo) {
 }
 
 TEST_P(TransportParameterizedTest, MdnsGetAddrInfo_fallback) {
+    // TODO: Remove the flags and fix the test.
+    ScopedSystemProperties sp1(kDotAsyncHandshakeFlag, "0");
+    ScopedSystemProperties sp2(kDotMaxretriesFlag, "3");
+    resetNetwork();
+
     constexpr char host_name[] = "hello.local.";
     test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService,
                               static_cast<ns_rcode>(-1));
@@ -570,6 +582,11 @@ TEST_F(PrivateDnsDohTest, ValidationFail) {
 //   - Fallback to UDP if DoH query times out
 //   - Fallback to DoT if DoH validation is in progress or has failed.
 TEST_F(PrivateDnsDohTest, QueryFailover) {
+    // TODO: Remove the flags and fix the test.
+    ScopedSystemProperties sp1(kDotAsyncHandshakeFlag, "0");
+    ScopedSystemProperties sp2(kDotMaxretriesFlag, "3");
+    resetNetwork();
+
     const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
     EXPECT_TRUE(WaitForDohValidation(test::kDefaultListenAddr, true));
@@ -835,6 +852,10 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     ASSERT_TRUE(dns_ipv6.startServer());
     ASSERT_TRUE(dot_ipv6.startServer());
     ASSERT_TRUE(doh_ipv6.startServer());
+
+    // It might already take several seconds before we are here. Add a ScopedSystemProperties
+    // to ensure the doh flag is 1 before creating a new network.
+    ScopedSystemProperties sp1(kDohFlag, "1");
     mDnsClient.SetupOemNetwork(TEST_NETID_2);
 
     parcel.netId = TEST_NETID_2;
@@ -853,6 +874,10 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
 
     // Expect two queries: one for DoH probe and the other one for kQueryHostname.
     EXPECT_EQ(doh_ipv6.queries(), 2);
+
+    // Add a ScopedSystemProperties here as well since DnsResolver will update its cached flags
+    // when the networks is removed.
+    ScopedSystemProperties sp2(kDohFlag, "1");
     mDnsClient.TearDownOemNetwork(TEST_NETID_2);
 
     // The DnsResolver will reconnect to the DoH server for the query that gets blocked at
@@ -1041,13 +1066,13 @@ TEST_F(PrivateDnsDohTest, SessionResumption) {
     const int initial_max_idle_timeout_ms = 1000;
     for (const auto& flag : {"0", "1"}) {
         SCOPED_TRACE(fmt::format("flag: {}", flag));
-        auto sp = make_unique<ScopedSystemProperties>(kDohSessionResumptionFlag, flag);
+        ScopedSystemProperties sp(kDohSessionResumptionFlag, flag);
 
         // Each loop takes around 3 seconds, if the system property "doh" is reset in the middle
         // of the first loop, this test will fail when running the second loop because DnsResolver
         // updates its "doh" flag when resetNetwork() is called. Therefore, add another
         // ScopedSystemProperties for "doh" to make the test more robust.
-        auto sp2 = make_unique<ScopedSystemProperties>(kDohFlag, "1");
+        ScopedSystemProperties sp2(kDohFlag, "1");
         resetNetwork();
 
         ASSERT_TRUE(doh.stopServer());
@@ -1076,7 +1101,7 @@ TEST_F(PrivateDnsDohTest, SessionResumption) {
 
         EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
         EXPECT_EQ(doh.connections(), 3);
-        EXPECT_EQ(doh.resumedConnections(), (flag == "1" ? 2 : 0));
+        EXPECT_EQ(doh.resumedConnections(), (strcmp(flag, "1") ? 0 : 2));
     }
 }
 
