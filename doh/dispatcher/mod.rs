@@ -87,9 +87,8 @@ impl Dispatcher {
             .build()?;
         let join_handle = runtime.spawn(async {
             let result = Driver::new(cmd_receiver, validation, tagger).drive().await;
-            match result {
-                Err(ref e) => error!("Dispatcher driver exited due to {:?}", e),
-                Ok(()) => (),
+            if let Err(ref e) = result {
+                error!("Dispatcher driver exited due to {:?}", e)
             }
             result
         });

@@ -1344,7 +1344,9 @@ static int _find_src_addr(const struct sockaddr* addr, struct sockaddr* src_addr
  * Will leave the list unchanged if an error occurs.
  */
 
-static void _rfc6724_sort(struct addrinfo* list_sentinel, unsigned mark, uid_t uid) {
+void resolv_rfc6724_sort(struct addrinfo* list_sentinel, unsigned mark, uid_t uid) {
+    if (list_sentinel == nullptr) return;
+
     struct addrinfo* cur;
     int nelem = 0, i;
     struct addrinfo_sort_elem* elems;
@@ -1437,12 +1439,7 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
 
     ResState res(netcontext, event);
 
-    setMdnsFlag(name, &(res.flags));
-
-    if (isMdnsResolution(res.flags)) {
-        q.qclass |= C_UNICAST;
-        q2.qclass |= C_UNICAST;
-    }
+    setMdnsFlag(name, res.netid, &(res.flags));
 
     int he;
     if (res_searchN(name, &q, &res, &he) < 0) {
@@ -1469,7 +1466,7 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
         return herrnoToAiErrno(he);
     }
 
-    _rfc6724_sort(&sentinel, netcontext->app_mark, netcontext->uid);
+    resolv_rfc6724_sort(&sentinel, netcontext->app_mark, netcontext->uid);
 
     *rv = sentinel.ai_next;
     return 0;
@@ -1657,13 +1654,14 @@ QueryResult doQuery(const char* name, res_target* t, ResState* res,
         if ((res_temp.netcontext_flags &
              (NET_CONTEXT_FLAG_USE_DNS_OVER_TLS | NET_CONTEXT_FLAG_USE_EDNS)) &&
             (res_temp.flags & RES_F_EDNS0ERR)) {
-            LOG(DEBUG) << __func__ << ": retry without EDNS0";
+            LOG(INFO) << __func__ << ": retry without EDNS0";
             n = res_nmkquery(QUERY, name, cl, type, {}, buf, res_temp.netcontext_flags);
             n = res_nsend(&res_temp, {buf, n}, {t->answer.data(), anslen}, &rcode, 0);
         }
     }
 
-    LOG(DEBUG) << __func__ << ": rcode=" << hp->rcode << ", ancount=" << ntohs(hp->ancount);
+    LOG(INFO) << __func__ << ": rcode=" << rcode << ", ancount=" << ntohs(hp->ancount)
+              << ", return value=" << n;
 
     t->n = n;
     return {
@@ -1785,7 +1783,7 @@ static int res_queryN(const char* name, res_target* target, ResState* res, int* 
                 retried = true;
                 goto again;
             }
-            LOG(DEBUG) << __func__ << ": rcode=" << hp->rcode << ", ancount=" << ntohs(hp->ancount);
+            LOG(INFO) << __func__ << ": rcode=" << rcode << ", ancount=" << ntohs(hp->ancount);
             continue;
         }
 

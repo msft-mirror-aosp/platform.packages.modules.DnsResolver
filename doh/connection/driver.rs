@@ -17,7 +17,7 @@
 
 use crate::boot_time;
 use crate::boot_time::BootTime;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use quiche::h3;
 use std::collections::HashMap;
 use std::default::Default;
@@ -107,7 +107,7 @@ struct H3Driver {
 }
 
 async fn optional_timeout(timeout: Option<boot_time::Duration>, net_id: u32) {
-    debug!("optional_timeout: timeout={:?}, network {}", timeout, net_id);
+    info!("optional_timeout: timeout={:?}, network {}", timeout, net_id);
     match timeout {
         Some(timeout) => boot_time::sleep(timeout).await,
         None => future::pending().await,
@@ -156,7 +156,7 @@ impl Driver {
     fn handle_closed(&self) -> Result<()> {
         if self.quiche_conn.is_closed() {
             // TODO: Also log local_error() once Quiche 0.10.0 is available.
-            debug!(
+            info!(
                 "Connection {} closed on network {}, peer_error={:x?}",
                 self.quiche_conn.trace_id(),
                 self.net_id,
@@ -173,7 +173,7 @@ impl Driver {
     fn handle_draining(&mut self) {
         if self.quiche_conn.is_draining() && !self.closing {
             // TODO: Also log local_error() once Quiche 0.10.0 is available.
-            debug!(
+            info!(
                 "Connection {} is draining on network {}, peer_error={:x?}",
                 self.quiche_conn.trace_id(),
                 self.net_id,
@@ -194,11 +194,24 @@ impl Driver {
     }
 
     async fn drive_once(mut self) -> Result<Self> {
+        // If the QUIC connection is live, but the HTTP/3 is not, try to bring it up
+        if self.quiche_conn.is_established() || self.quiche_conn.is_in_early_data() {
+            info!(
+                "Connection {} established on network {}",
+                self.quiche_conn.trace_id(),
+                self.net_id
+            );
+            let h3_config = h3::Config::new()?;
+            let h3_conn = h3::Connection::with_transport(&mut self.quiche_conn, &h3_config)?;
+            self = H3Driver::new(self, h3_conn).drive().await?;
+            let _ = self.status_tx.send(Status::QUIC);
+        }
+
         let timer = optional_timeout(self.quiche_conn.timeout(), self.net_id);
         select! {
             // If a quiche timer would fire, call their callback
             _ = timer => {
-                debug!("Driver: Timer expired on network {}", self.net_id);
+                info!("Driver: Timer expired on network {}", self.net_id);
                 self.quiche_conn.on_timeout()
             }
             // If we got packets from our peer, pass them to quiche
@@ -209,19 +222,6 @@ impl Driver {
         };
         // Any of the actions in the select could require us to send packets to the peer
         self.flush_tx().await?;
-
-        // If the QUIC connection is live, but the HTTP/3 is not, try to bring it up
-        if self.quiche_conn.is_established() {
-            debug!(
-                "Connection {} established on network {}",
-                self.quiche_conn.trace_id(),
-                self.net_id
-            );
-            let h3_config = h3::Config::new()?;
-            let h3_conn = h3::Connection::with_transport(&mut self.quiche_conn, &h3_config)?;
-            self = H3Driver::new(self, h3_conn).drive().await?;
-            let _ = self.status_tx.send(Status::QUIC);
-        }
 
         // If the connection has entered draining state (the server is closing the connection),
         // tell the status watcher not to use the connection. Besides, per Quiche document,
@@ -264,15 +264,12 @@ impl H3Driver {
     async fn drive(mut self) -> Result<Driver> {
         let _ = self.driver.status_tx.send(Status::H3);
         loop {
-            match self.drive_once().await {
-                Err(e) => {
-                    let _ = self
-                        .driver
-                        .status_tx
-                        .send(Status::Dead { session: self.driver.quiche_conn.session() });
-                    return Err(e);
-                }
-                Ok(()) => (),
+            if let Err(e) = self.drive_once().await {
+                let _ = self
+                    .driver
+                    .status_tx
+                    .send(Status::Dead { session: self.driver.quiche_conn.session() });
+                return Err(e);
             }
         }
     }
@@ -288,7 +285,8 @@ impl H3Driver {
         }
         select! {
             // Only attempt to enqueue new requests if we have no buffered request and aren't
-            // closing
+            // closing. Maybe limit the number of in-flight queries if the handshake
+            // still hasn't finished.
             msg = self.driver.request_rx.recv(), if !self.driver.closing && self.buffered_request.is_none() => {
                 match msg {
                     Some(request) => self.handle_request(request)?,
@@ -297,7 +295,7 @@ impl H3Driver {
             },
             // If a quiche timer would fire, call their callback
             _ = timer => {
-                debug!("H3Driver: Timer expired on network {}", self.driver.net_id);
+                info!("H3Driver: Timer expired on network {}", self.driver.net_id);
                 self.driver.quiche_conn.on_timeout()
             }
             // If we got packets from our peer, pass them to quiche
@@ -324,8 +322,8 @@ impl H3Driver {
     }
 
     fn handle_request(&mut self, request: Request) -> Result<()> {
-        debug!("Handling DNS request on network {}, stats={:?}, peer_streams_left_bidi={}, peer_streams_left_uni={}",
-                self.driver.net_id, self.driver.quiche_conn.stats(), self.driver.quiche_conn.peer_streams_left_bidi(), self.driver.quiche_conn.peer_streams_left_uni());
+        info!("Handling DNS request on network {}, is_in_early_data={}, stats=[{:?}], peer_streams_left_bidi={}, peer_streams_left_uni={}",
+                self.driver.net_id, self.driver.quiche_conn.is_in_early_data(), self.driver.quiche_conn.stats(), self.driver.quiche_conn.peer_streams_left_bidi(), self.driver.quiche_conn.peer_streams_left_uni());
         // If the request has already timed out, don't issue it to the server.
         if let Some(expiry) = request.expiry {
             if BootTime::now() > expiry {
@@ -342,14 +340,14 @@ impl H3Driver {
                     // buffered_request, or when buffered_request is empty. This assert just
                     // validates that we don't break that assumption later, as it could result in
                     // requests being dropped on the floor under high load.
-                    debug!("Stream has become blocked, buffering one request.");
+                    info!("Stream has become blocked, buffering one request.");
                     assert!(self.buffered_request.is_none());
                     self.buffered_request = Some(request);
                     return Ok(())
                 }
                 result => result?,
             };
-        debug!(
+        info!(
             "Handled DNS request: stream ID {}, network {}, stream_capacity={:?}",
             stream_id,
             self.driver.net_id,
@@ -375,13 +373,13 @@ impl H3Driver {
                         return Ok(());
                     }
                     Err(e) => {
-                        debug!("recv_body: Error={:?}", e);
+                        info!("recv_body: Error={:?}", e);
                         stream.data.truncate(base_len);
                         return Err(e.into());
                     }
                     Ok(recvd) => {
                         stream.data.truncate(base_len + recvd);
-                        debug!(
+                        info!(
                             "Got {} bytes of response data from stream ID {} on network {}",
                             recvd, stream_id, self.driver.net_id
                         );
@@ -464,7 +462,7 @@ impl H3Driver {
     }
 
     async fn shutdown(&mut self, send_goaway: bool, msg: &[u8]) -> Result<()> {
-        debug!(
+        info!(
             "Closing connection {} on network {} with msg {:?}",
             self.driver.quiche_conn.trace_id(),
             self.driver.net_id,

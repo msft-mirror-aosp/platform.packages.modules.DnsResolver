@@ -16,9 +16,6 @@ cc_test_library {
     header_libs: [
         "libnetd_resolv_headers",
     ],
-    shared_libs: [
-        "libutils",
-    ],
     static_libs: [
         "netd_aidl_interface-lateststable-ndk",
         "libnetd_test_dnsresponder_ndk",
@@ -83,6 +80,7 @@ cc_library_static {
 cc_test {
     name: "resolv_gold_test",
     test_suites: ["general-tests", "mts-dnsresolver"],
+    isolated: false,
     require_root: true,
     // b/151392634, this is a workaround because MTS
     // can not handle the test with testdata correctly.
@@ -124,6 +122,7 @@ cc_test {
 cc_test {
     name: "resolv_stress_test",
     test_suites: ["general-tests", "mts-dnsresolver"],
+    isolated: false,
     // This won't work with test_config
     // require_root: true,
     // TODO: Remove resolv_test_mts_coverage_defaults after mts coverage switched to 64-bit device.
@@ -144,7 +143,6 @@ cc_test {
         "libnetd_test_dnsresponder_ndk",
         "libnetd_test_resolv_utils",
         "libnetdutils",
-        "libutils",
         "netd_event_listener_interface-lateststable-ndk",
         "netd_aidl_interface-lateststable-ndk",
     ],
@@ -153,6 +151,7 @@ cc_test {
 cc_test {
     name: "resolv_integration_test",
     test_suites: ["general-tests", "mts-dnsresolver"],
+    isolated: false,
     require_root: true,
     test_config_template: ":resolv_test_config_template",
     defaults: ["netd_defaults", "resolv_test_defaults"],
@@ -186,7 +185,7 @@ cc_test {
         "libnetd_test_resolv_utils",
         "libnetdutils",
         "libssl",
-        "libutils",
+        "libcutils",
         "netd_aidl_interface-lateststable-ndk",
         "netd_event_listener_interface-lateststable-ndk",
         "libip_checksum",
@@ -213,6 +212,7 @@ cc_test {
         "general-tests",
         "mts-dnsresolver",
     ],
+    isolated: false,
     require_root: true,
     // TODO: Drop root privileges and make it be an real unit test.
     // TODO: Remove resolv_test_mts_coverage_defaults after mts coverage switched to 64-bit device.
@@ -248,7 +248,6 @@ cc_test {
         "libstatslog_resolv",
         "libstatspush_compat",
         "libsysutils",
-        "libutils",
         "resolv_stats_test_utils",
         "server_configurable_flags",
         "stats_proto",
@@ -294,7 +293,10 @@ cc_test {
     test_suites: [
         "general-tests",
     ],
-    defaults: ["netd_defaults"],
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+    ],
     header_libs: [
         "libnetd_resolv_internal_headers",
     ],
@@ -303,11 +305,9 @@ cc_test {
         "libcrypto_static",
         "libdoh_ffi_for_test",
         "libgmock",
-        "liblog",
         "libssl",
     ],
     shared_libs: [
         "libnetd_client",
     ],
-    min_sdk_version: "29",
 }

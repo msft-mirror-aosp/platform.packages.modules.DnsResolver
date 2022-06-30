@@ -145,6 +145,9 @@ void PrivateDnsConfiguration::clear(unsigned netId) {
     std::lock_guard guard(mPrivateDnsLock);
     mPrivateDnsModes.erase(netId);
     mPrivateDnsTransports.erase(netId);
+
+    // Notify the relevant private DNS validations, if they are waiting, to finish.
+    mCv.notify_all();
 }
 
 base::Result<void> PrivateDnsConfiguration::requestValidation(unsigned netId,
@@ -224,14 +227,17 @@ void PrivateDnsConfiguration::startValidation(const ServerIdentity& identity, un
             const bool needs_reeval =
                     this->recordPrivateDnsValidation(identity, netId, success, isRevalidation);
 
-            if (!needs_reeval) {
+            if (!needs_reeval || !backoff.hasNextTimeout()) {
                 break;
             }
 
-            if (backoff.hasNextTimeout()) {
-                // TODO: make the thread able to receive signals to shutdown early.
-                std::this_thread::sleep_for(backoff.getNextTimeout());
-            } else {
+            std::unique_lock<std::mutex> cvGuard(mPrivateDnsLock);
+            // If the timeout expired and the predicate still evaluates to false, wait_for returns
+            // false.
+            if (mCv.wait_for(cvGuard, backoff.getNextTimeout(),
+                             [this, netId]() REQUIRES(mPrivateDnsLock) {
+                                 return mPrivateDnsModes.find(netId) == mPrivateDnsModes.end();
+                             })) {
                 break;
             }
         }
@@ -295,11 +301,8 @@ bool PrivateDnsConfiguration::recordPrivateDnsValidation(const ServerIdentity& i
     }
 
     bool reevaluationStatus = NEEDS_REEVALUATION;
-    if (success) {
-        reevaluationStatus = DONT_REEVALUATE;
-    } else if (mode->second == PrivateDnsMode::OFF) {
-        reevaluationStatus = DONT_REEVALUATE;
-    } else if (mode->second == PrivateDnsMode::OPPORTUNISTIC && !isRevalidation) {
+    if (success || (mode->second == PrivateDnsMode::OFF) ||
+        (mode->second == PrivateDnsMode::OPPORTUNISTIC && !isRevalidation)) {
         reevaluationStatus = DONT_REEVALUATE;
     }
 
@@ -507,10 +510,12 @@ int PrivateDnsConfiguration::setDoh(int32_t netId, uint32_t mark,
                         getTimeoutFromFlag("doh_idle_timeout_ms", kDohIdleDefaultTimeoutMs),
                 .use_session_resumption =
                         Experiments::getInstance()->getFlag("doh_session_resumption", 0) == 1,
+                .enable_early_data = Experiments::getInstance()->getFlag("doh_early_data", 0) == 1,
         };
         LOG(DEBUG) << __func__ << ": probe_timeout_ms=" << flags.probe_timeout_ms
                    << ", idle_timeout_ms=" << flags.idle_timeout_ms
-                   << ", use_session_resumption=" << flags.use_session_resumption;
+                   << ", use_session_resumption=" << flags.use_session_resumption
+                   << ", enable_early_data=" << flags.enable_early_data;
 
         return doh_net_new(mDohDispatcher, netId, dohId.httpsTemplate.c_str(), dohId.host.c_str(),
                            dohId.ipAddr.c_str(), mark, caCert.c_str(), &flags);

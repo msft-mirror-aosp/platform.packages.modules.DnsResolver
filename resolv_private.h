@@ -89,8 +89,6 @@ union sockaddr_union {
 };
 constexpr int MAXPACKET = 8 * 1024;
 
-const unsigned C_UNICAST = 0x8000;  // unicast-response bit for MDNS
-
 struct ResState {
     ResState(const android_net_context* netcontext, android::net::NetworkDnsEventReported* dnsEvent)
         : netid(netcontext->dns_netid),
@@ -185,7 +183,7 @@ int getaddrinfo_numeric(const char* hostname, const char* servname, addrinfo hin
 int herrnoToAiErrno(int herrno);
 
 // Helper function to enable MDNS resolution.
-void setMdnsFlag(std::string_view hostname, uint32_t* flags);
+void setMdnsFlag(std::string_view hostname, unsigned netid, uint32_t* flags);
 
 // Helper function for checking MDNS resolution is enabled or not.
 bool isMdnsResolution(uint32_t flags);

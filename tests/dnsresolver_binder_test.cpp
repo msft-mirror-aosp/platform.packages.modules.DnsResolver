@@ -37,6 +37,7 @@
 #include <gtest/gtest.h>
 #include <netdutils/Stopwatch.h>
 
+#include <util.h>
 #include "dns_metrics_listener/base_metrics_listener.h"
 #include "dns_metrics_listener/test_metrics.h"
 #include "unsolicited_listener/unsolicited_event_listener.h"
@@ -44,6 +45,7 @@
 #include "ResolverStats.h"
 #include "dns_responder.h"
 #include "dns_responder_client_ndk.h"
+#include "tests/resolv_test_base.h"
 
 using aidl::android::net::IDnsResolver;
 using aidl::android::net::ResolverHostsParcel;
@@ -92,7 +94,7 @@ std::vector<std::string> dumpService(ndk::SpAIBinder binder) {
 
 }  // namespace
 
-class DnsResolverBinderTest : public ::testing::Test {
+class DnsResolverBinderTest : public ResolvTestBase {
   public:
     DnsResolverBinderTest() {
         ndk::SpAIBinder resolvBinder = ndk::SpAIBinder(AServiceManager_getService("dnsresolver"));
@@ -620,9 +622,15 @@ TEST_F(DnsResolverBinderTest, setLogSeverity) {
     EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_ERROR).isOk());
     mExpectedLogData.push_back({"setLogSeverity(4)", "setLogSeverity.*4"});
 
-    // Set back to default
-    EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_WARNING).isOk());
-    mExpectedLogData.push_back({"setLogSeverity(3)", "setLogSeverity.*3"});
+    // Set back to default based off resolv_init(), the default is INFO for userdebug builds
+    // and is WARNING for the other builds.
+    if (isUserDebugBuild()) {
+        EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_INFO).isOk());
+        mExpectedLogData.push_back({"setLogSeverity(2)", "setLogSeverity.*2"});
+    } else {
+        EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_WARNING).isOk());
+        mExpectedLogData.push_back({"setLogSeverity(3)", "setLogSeverity.*3"});
+    }
 }
 
 TEST_F(DnsResolverBinderTest, SetResolverOptions) {
