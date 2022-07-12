@@ -35,6 +35,7 @@
 #include <android/binder_process.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
+#include <netdutils/NetNativeTestBase.h>
 #include <netdutils/Stopwatch.h>
 
 #include <util.h>
@@ -45,7 +46,6 @@
 #include "ResolverStats.h"
 #include "dns_responder.h"
 #include "dns_responder_client_ndk.h"
-#include "tests/resolv_test_base.h"
 
 using aidl::android::net::IDnsResolver;
 using aidl::android::net::ResolverHostsParcel;
@@ -94,7 +94,7 @@ std::vector<std::string> dumpService(ndk::SpAIBinder binder) {
 
 }  // namespace
 
-class DnsResolverBinderTest : public ResolvTestBase {
+class DnsResolverBinderTest : public NetNativeTestBase {
   public:
     DnsResolverBinderTest() {
         ndk::SpAIBinder resolvBinder = ndk::SpAIBinder(AServiceManager_getService("dnsresolver"));
@@ -360,19 +360,13 @@ TEST_F(DnsResolverBinderTest, RegisterEventListener_onDnsEvent) {
     dnsClient.SetUp();
 
     // Setup DNS responder server.
-    constexpr char listen_addr[] = "127.0.0.3";
     constexpr char listen_srv[] = "53";
-    test::DNSResponder dns(listen_addr, listen_srv, ns_rcode::ns_r_servfail);
+    test::DNSResponder dns(kDefaultServer, listen_srv, ns_rcode::ns_r_servfail);
     dns.addMapping("hi.example.com.", ns_type::ns_t_a, "1.2.3.4");
     ASSERT_TRUE(dns.startServer());
 
     // Setup DNS configuration.
-    const std::vector<std::string> test_servers = {listen_addr};
-    std::vector<std::string> test_domains = {"example.com"};
-    std::vector<int> test_params = {300 /*sample_validity*/, 25 /*success_threshold*/,
-                                    8 /*min_samples*/, 8 /*max_samples*/};
-
-    ASSERT_TRUE(dnsClient.SetResolversForNetwork(test_servers, test_domains, test_params));
+    ASSERT_TRUE(dnsClient.SetResolversForNetwork());
     dns.clearQueries();
 
     // Register event listener.
@@ -419,7 +413,6 @@ TEST_F(DnsResolverBinderTest, SetResolverConfiguration_Tls) {
     static const std::vector<std::string> invalid_v4_addr = {"192.0.*.5"};
     static const std::vector<std::string> invalid_v6_addr = {"2001:dg8::6"};
     constexpr char valid_tls_name[] = "example.com";
-    std::vector<int> test_params = {300, 25, 8, 8};
     // We enumerate valid and invalid v4/v6 address, and several different TLS names
     // to be the input data and verify the binder status.
     static const struct TestData {
@@ -449,9 +442,11 @@ TEST_F(DnsResolverBinderTest, SetResolverConfiguration_Tls) {
 
     for (size_t i = 0; i < std::size(kTlsTestData); i++) {
         const auto& td = kTlsTestData[i];
-
-        const auto resolverParams = DnsResponderClient::makeResolverParamsParcel(
-                TEST_NETID, test_params, LOCALLY_ASSIGNED_DNS, {}, td.tlsName, td.servers);
+        const auto resolverParams = ResolverParams::Builder()
+                                            .setDnsServers(LOCALLY_ASSIGNED_DNS)
+                                            .setDotServers(td.servers)
+                                            .setPrivateDnsProvider(td.tlsName)
+                                            .build();
         ::ndk::ScopedAStatus status = mDnsResolver->setResolverConfiguration(resolverParams);
 
         if (td.expectedReturnCode == 0) {
@@ -505,15 +500,19 @@ TEST_F(DnsResolverBinderTest, SetResolverConfiguration_TransportTypes_Default) {
 TEST_F(DnsResolverBinderTest, GetResolverInfo) {
     std::vector<std::string> servers = {"127.0.0.1", "127.0.0.2"};
     std::vector<std::string> domains = {"example.com"};
-    std::vector<int> testParams = {
+    std::array<int, aidl::android::net::IDnsResolver::RESOLVER_PARAMS_COUNT> testParams = {
             300,     // sample validity in seconds
             25,      // success threshod in percent
             8,   8,  // {MIN,MAX}_SAMPLES
             100,     // BASE_TIMEOUT_MSEC
             3,       // retry count
     };
-    const auto resolverParams = DnsResponderClient::makeResolverParamsParcel(
-            TEST_NETID, testParams, servers, domains, "", {});
+    const auto resolverParams = ResolverParams::Builder()
+                                        .setDomains(domains)
+                                        .setDnsServers(servers)
+                                        .setDotServers({})
+                                        .setParams(testParams)
+                                        .build();
     ::ndk::ScopedAStatus status = mDnsResolver->setResolverConfiguration(resolverParams);
     EXPECT_TRUE(status.isOk()) << status.getMessage();
     mExpectedLogDataWithPacel.push_back(toSetResolverConfigurationLogData(resolverParams));

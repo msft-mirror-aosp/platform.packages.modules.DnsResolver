@@ -25,6 +25,7 @@
 #include <NetdClient.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
+#include <netdutils/NetNativeTestBase.h>
 
 static const char* GOOGLE_SERVER_IP = "8.8.8.8";
 static const int TIMEOUT_MS = 3000;
@@ -35,7 +36,9 @@ std::mutex m;
 std::condition_variable cv;
 unsigned int dnsNetId;
 
-TEST(DoHFFITest, SmokeTest) {
+class DoHFFITest : public NetNativeTestBase {};
+
+TEST_F(DoHFFITest, SmokeTest) {
     getNetworkForDns(&dnsNetId);
     // To ensure that we have a real network.
     ASSERT_GE(dnsNetId, MINIMAL_NET_ID) << "No available networks";
@@ -57,6 +60,7 @@ TEST(DoHFFITest, SmokeTest) {
             .probe_timeout_ms = TIMEOUT_MS,
             .idle_timeout_ms = TIMEOUT_MS,
             .use_session_resumption = true,
+            .enable_early_data = true,
     };
 
     // TODO: Use a local server instead of dns.google.
