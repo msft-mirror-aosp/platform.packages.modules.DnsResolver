@@ -30,7 +30,6 @@
 #include <netdutils/NetNativeTestBase.h>
 #include <netdutils/Stopwatch.h>
 
-#include "PrivateDnsConfiguration.h"
 #include "doh_frontend.h"
 #include "tests/dns_responder/dns_responder.h"
 #include "tests/dns_responder/dns_responder_client_ndk.h"
@@ -54,17 +53,10 @@ using android::netdutils::Stopwatch;
 using std::chrono::milliseconds;
 using std::this_thread::sleep_for;
 
-const std::string kDohFlag("persist.device_config.netd_native.doh");
-const std::string kDohQueryTimeoutFlag("persist.device_config.netd_native.doh_query_timeout_ms");
-const std::string kDohProbeTimeoutFlag("persist.device_config.netd_native.doh_probe_timeout_ms");
-const std::string kDohIdleTimeoutFlag("persist.device_config.netd_native.doh_idle_timeout_ms");
-const std::string kDohSessionResumptionFlag(
-        "persist.device_config.netd_native.doh_session_resumption");
-const std::string kDohEarlyDataFlag("persist.device_config.netd_native.doh_early_data");
-const std::string kDotAsyncHandshakeFlag("persist.device_config.netd_native.dot_async_handshake");
-const std::string kDotMaxretriesFlag("persist.device_config.netd_native.dot_maxtries");
-
 constexpr int MAXPACKET = (8 * 1024);
+
+// Constant values sync'd from PrivateDnsConfiguration.
+constexpr int kDohIdleDefaultTimeoutMs = 55000;
 
 namespace {
 
@@ -274,10 +266,6 @@ class BaseTest : public NetNativeTestBase {
 
 class BasePrivateDnsTest : public BaseTest {
   public:
-    static constexpr char kDnsPort[] = "53";
-    static constexpr char kDohPort[] = "443";
-    static constexpr char kDotPort[] = "853";
-
     static void SetUpTestSuite() {
         BaseTest::SetUpTestSuite();
         test::DohFrontend::initRustAndroidLogger();
@@ -348,11 +336,11 @@ class BasePrivateDnsTest : public BaseTest {
     static constexpr char kQueryAnswerA[] = "1.2.3.4";
     static constexpr char kQueryAnswerAAAA[] = "2001:db8::100";
 
-    test::DNSResponder dns{test::kDefaultListenAddr, kDnsPort};
-    test::DohFrontend doh{test::kDefaultListenAddr, kDohPort, "127.0.1.3", kDnsPort};
-    test::DnsTlsFrontend dot{test::kDefaultListenAddr, kDotPort, "127.0.2.3", kDnsPort};
-    test::DNSResponder doh_backend{"127.0.1.3", kDnsPort};
-    test::DNSResponder dot_backend{"127.0.2.3", kDnsPort};
+    test::DNSResponder dns{test::kDefaultListenAddr, kDnsPortString};
+    test::DohFrontend doh{test::kDefaultListenAddr, kDohPortString, "127.0.1.3", kDnsPortString};
+    test::DnsTlsFrontend dot{test::kDefaultListenAddr, kDotPortString, "127.0.2.3", kDnsPortString};
+    test::DNSResponder doh_backend{"127.0.1.3", kDnsPortString};
+    test::DNSResponder dot_backend{"127.0.2.3", kDnsPortString};
 
     // Used to enable DoH during the tests and set up a shorter timeout.
     std::unique_ptr<ScopedSystemProperties> mDohScopedProp;
@@ -638,8 +626,8 @@ TEST_F(PrivateDnsDohTest, PreferIpv6) {
     // To simplify the test, set the DoT server broken.
     dot.stopServer();
 
-    test::DNSResponder dns_ipv6{listen_ipv6_addr, kDnsPort};
-    test::DohFrontend doh_ipv6{listen_ipv6_addr, kDohPort, listen_ipv6_addr, kDnsPort};
+    test::DNSResponder dns_ipv6{listen_ipv6_addr, kDnsPortString};
+    test::DohFrontend doh_ipv6{listen_ipv6_addr, kDohPortString, listen_ipv6_addr, kDnsPortString};
     dns_ipv6.addMapping(kQueryHostname, ns_type::ns_t_a, kQueryAnswerA);
     dns_ipv6.addMapping(kQueryHostname, ns_type::ns_t_aaaa, kQueryAnswerAAAA);
     ASSERT_TRUE(dns_ipv6.startServer());
@@ -675,8 +663,8 @@ TEST_F(PrivateDnsDohTest, ChangeAndClearPrivateDnsServer) {
     // To simplify the test, set the DoT server broken.
     dot.stopServer();
 
-    test::DNSResponder dns_ipv6{listen_ipv6_addr, kDnsPort};
-    test::DohFrontend doh_ipv6{listen_ipv6_addr, kDohPort, listen_ipv6_addr, kDnsPort};
+    test::DNSResponder dns_ipv6{listen_ipv6_addr, kDnsPortString};
+    test::DohFrontend doh_ipv6{listen_ipv6_addr, kDohPortString, listen_ipv6_addr, kDnsPortString};
     dns_ipv6.addMapping(kQueryHostname, ns_type::ns_t_a, kQueryAnswerA);
     dns_ipv6.addMapping(kQueryHostname, ns_type::ns_t_aaaa, kQueryAnswerAAAA);
     ASSERT_TRUE(dns_ipv6.startServer());
@@ -731,8 +719,9 @@ TEST_F(PrivateDnsDohTest, ChangePrivateDnsServerAndVerifyOutput) {
     static const std::string ipv4DohServerAddr = "127.0.0.3";
     static const std::string ipv6DohServerAddr = "::1";
 
-    test::DNSResponder dns_ipv6{ipv6DohServerAddr, kDnsPort};
-    test::DohFrontend doh_ipv6{ipv6DohServerAddr, kDohPort, ipv6DohServerAddr, kDnsPort};
+    test::DNSResponder dns_ipv6{ipv6DohServerAddr, kDnsPortString};
+    test::DohFrontend doh_ipv6{ipv6DohServerAddr, kDohPortString, ipv6DohServerAddr,
+                               kDnsPortString};
     dns.addMapping(kQueryHostname, ns_type::ns_t_a, kQueryAnswerA);
     dns.addMapping(kQueryHostname, ns_type::ns_t_aaaa, kQueryAnswerAAAA);
     dns_ipv6.addMapping(kQueryHostname, ns_type::ns_t_a, kQueryAnswerA);
@@ -744,12 +733,12 @@ TEST_F(PrivateDnsDohTest, ChangePrivateDnsServerAndVerifyOutput) {
     auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
     EXPECT_TRUE(WaitForDohValidation(test::kDefaultListenAddr, true));
-    EXPECT_TRUE(expectLog(ipv4DohServerAddr, kDohPort));
+    EXPECT_TRUE(expectLog(ipv4DohServerAddr, kDohPortString));
 
     // Change to an invalid DoH server.
     parcel.tlsServers = {kHelloExampleComAddrV4};
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
-    EXPECT_FALSE(expectLog(kHelloExampleComAddrV4, kDohPort));
+    EXPECT_FALSE(expectLog(kHelloExampleComAddrV4, kDohPortString));
     EXPECT_TRUE(expectLog("<no data>", ""));
 
     // Change to the v6 DoH server.
@@ -757,14 +746,14 @@ TEST_F(PrivateDnsDohTest, ChangePrivateDnsServerAndVerifyOutput) {
     parcel.tlsServers = {ipv6DohServerAddr};
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
     EXPECT_TRUE(WaitForDohValidation(ipv6DohServerAddr, true));
-    EXPECT_TRUE(expectLog(ipv6DohServerAddr, kDohPort));
-    EXPECT_FALSE(expectLog(ipv4DohServerAddr, kDohPort));
+    EXPECT_TRUE(expectLog(ipv6DohServerAddr, kDohPortString));
+    EXPECT_FALSE(expectLog(ipv4DohServerAddr, kDohPortString));
 
     // Remove the private DNS server.
     parcel.tlsServers = {};
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
-    EXPECT_FALSE(expectLog(ipv4DohServerAddr, kDohPort));
-    EXPECT_FALSE(expectLog(ipv6DohServerAddr, kDohPort));
+    EXPECT_FALSE(expectLog(ipv4DohServerAddr, kDohPortString));
+    EXPECT_FALSE(expectLog(ipv6DohServerAddr, kDohPortString));
     EXPECT_TRUE(expectLog("<no data>", ""));
 }
 
@@ -851,9 +840,10 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     // Set up another network and send a DNS query. Expect that this network is unaffected.
     constexpr int TEST_NETID_2 = 31;
     constexpr char listen_ipv6_addr[] = "::1";
-    test::DNSResponder dns_ipv6{listen_ipv6_addr, kDnsPort};
-    test::DnsTlsFrontend dot_ipv6{listen_ipv6_addr, kDotPort, listen_ipv6_addr, kDnsPort};
-    test::DohFrontend doh_ipv6{listen_ipv6_addr, kDohPort, listen_ipv6_addr, kDnsPort};
+    test::DNSResponder dns_ipv6{listen_ipv6_addr, kDnsPortString};
+    test::DnsTlsFrontend dot_ipv6{listen_ipv6_addr, kDotPortString, listen_ipv6_addr,
+                                  kDnsPortString};
+    test::DohFrontend doh_ipv6{listen_ipv6_addr, kDohPortString, listen_ipv6_addr, kDnsPortString};
 
     dns_ipv6.addMapping(kQueryHostname, ns_type::ns_t_aaaa, kQueryAnswerAAAA);
     ASSERT_TRUE(dns_ipv6.startServer());
@@ -1035,8 +1025,7 @@ TEST_F(PrivateDnsDohTest, ConnectionIdleTimer) {
 
     // Check if the default value or the timeout the device is using is too short for the test.
     const int device_connection_idle_timeout =
-            std::min(std::stoi(GetProperty(kDohIdleTimeoutFlag, "9999")),
-                     android::net::PrivateDnsConfiguration::kDohIdleDefaultTimeoutMs);
+            std::min(std::stoi(GetProperty(kDohIdleTimeoutFlag, "9999")), kDohIdleDefaultTimeoutMs);
     if (device_connection_idle_timeout <= connection_idle_timeout + tolerance_ms) {
         GTEST_LOG_(INFO) << "The test can't guarantee that the flag takes effect because "
                          << "device_connection_idle_timeout is too short: "
