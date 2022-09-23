@@ -25,6 +25,8 @@
 
 #include <aidl/android/net/INetd.h>
 #include <android-base/properties.h>
+#include <android-modules-utils/sdk_level.h>
+#include <firewall.h>
 #include <gtest/gtest.h>
 #include <netdutils/InternetAddresses.h>
 
@@ -41,24 +43,38 @@ class ScopeBlockedUIDRule {
         // this purpose because netd calls fchown() on the DNS query sockets, and "iptables -m
         // owner" matches the UID of the socket creator, not the UID set by fchown().
         // TODO: migrate FIREWALL_CHAIN_NONE to eBPF as well.
-        EXPECT_TRUE(mNetSrv->firewallEnableChildChain(INetd::FIREWALL_CHAIN_STANDBY, true).isOk());
-        EXPECT_TRUE(mNetSrv->firewallSetUidRule(INetd::FIREWALL_CHAIN_STANDBY, mTestUid,
-                                                INetd::FIREWALL_RULE_DENY)
-                            .isOk());
+        if (android::modules::sdklevel::IsAtLeastT()) {
+            mFw = Firewall::getInstance();
+            EXPECT_RESULT_OK(mFw->toggleStandbyMatch(true));
+            EXPECT_RESULT_OK(mFw->addRule(mTestUid, STANDBY_MATCH));
+        } else {
+            EXPECT_TRUE(
+                    mNetSrv->firewallEnableChildChain(INetd::FIREWALL_CHAIN_STANDBY, true).isOk());
+            EXPECT_TRUE(mNetSrv->firewallSetUidRule(INetd::FIREWALL_CHAIN_STANDBY, mTestUid,
+                                                    INetd::FIREWALL_RULE_DENY)
+                                .isOk());
+        }
         EXPECT_TRUE(seteuid(mTestUid) == 0);
     };
     ~ScopeBlockedUIDRule() {
         // Restore uid
         EXPECT_TRUE(seteuid(mSavedUid) == 0);
         // Remove drop rule for testUid, and disable the standby chain.
-        EXPECT_TRUE(mNetSrv->firewallSetUidRule(INetd::FIREWALL_CHAIN_STANDBY, mTestUid,
-                                                INetd::FIREWALL_RULE_ALLOW)
-                            .isOk());
-        EXPECT_TRUE(mNetSrv->firewallEnableChildChain(INetd::FIREWALL_CHAIN_STANDBY, false).isOk());
+        if (android::modules::sdklevel::IsAtLeastT()) {
+            EXPECT_RESULT_OK(mFw->removeRule(mTestUid, STANDBY_MATCH));
+            EXPECT_RESULT_OK(mFw->toggleStandbyMatch(false));
+        } else {
+            EXPECT_TRUE(mNetSrv->firewallSetUidRule(INetd::FIREWALL_CHAIN_STANDBY, mTestUid,
+                                                    INetd::FIREWALL_RULE_ALLOW)
+                                .isOk());
+            EXPECT_TRUE(
+                    mNetSrv->firewallEnableChildChain(INetd::FIREWALL_CHAIN_STANDBY, false).isOk());
+        }
     }
 
   private:
     INetd* mNetSrv;
+    Firewall* mFw;
     const uid_t mTestUid;
     const uid_t mSavedUid;
 };
@@ -99,6 +115,32 @@ constexpr int TEST_NETID = 30;
 // Use the biggest two reserved appId for applications to avoid conflict with existing uids.
 constexpr int TEST_UID = 99999;
 constexpr int TEST_UID2 = 99998;
+
+constexpr char kDnsPortString[] = "53";
+constexpr char kDohPortString[] = "443";
+constexpr char kDotPortString[] = "853";
+
+const std::string kFlagPrefix("persist.device_config.netd_native.");
+
+const std::string kDohEarlyDataFlag(kFlagPrefix + "doh_early_data");
+const std::string kDohFlag(kFlagPrefix + "doh");
+const std::string kDohIdleTimeoutFlag(kFlagPrefix + "doh_idle_timeout_ms");
+const std::string kDohProbeTimeoutFlag(kFlagPrefix + "doh_probe_timeout_ms");
+const std::string kDohQueryTimeoutFlag(kFlagPrefix + "doh_query_timeout_ms");
+const std::string kDohSessionResumptionFlag(kFlagPrefix + "doh_session_resumption");
+const std::string kDotAsyncHandshakeFlag(kFlagPrefix + "dot_async_handshake");
+const std::string kDotConnectTimeoutMsFlag(kFlagPrefix + "dot_connect_timeout_ms");
+const std::string kDotMaxretriesFlag(kFlagPrefix + "dot_maxtries");
+const std::string kDotQueryTimeoutMsFlag(kFlagPrefix + "dot_query_timeout_ms");
+const std::string kDotQuickFallbackFlag(kFlagPrefix + "dot_quick_fallback");
+const std::string kDotRevalidationThresholdFlag(kFlagPrefix + "dot_revalidation_threshold");
+const std::string kDotXportUnusableThresholdFlag(kFlagPrefix + "dot_xport_unusable_threshold");
+const std::string kDotValidationLatencyFactorFlag(kFlagPrefix + "dot_validation_latency_factor");
+const std::string kDotValidationLatencyOffsetMsFlag(kFlagPrefix +
+                                                    "dot_validation_latency_offset_ms");
+const std::string kRetransIntervalFlag(kFlagPrefix + "retransmission_time_interval");
+const std::string kRetryCountFlag(kFlagPrefix + "retry_count");
+const std::string kSortNameserversFlag(kFlagPrefix + "sort_nameservers");
 
 static constexpr char kLocalHost[] = "localhost";
 static constexpr char kLocalHostAddr[] = "127.0.0.1";

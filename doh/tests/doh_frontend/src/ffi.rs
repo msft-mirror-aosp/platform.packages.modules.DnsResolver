@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-use crate::dns_https_frontend::DohFrontend;
-use crate::stats::Stats;
+use super::dns_https_frontend::DohFrontend;
+use super::stats::Stats;
 
 use anyhow::{bail, Result};
 use libc::c_char;
@@ -79,7 +79,7 @@ pub extern "C" fn frontend_stop(doh: &mut DohFrontend) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn frontend_delete(doh: *mut DohFrontend) {
     if !doh.is_null() {
-        Box::from_raw(doh);
+        drop(Box::from_raw(doh));
     }
 }
 
@@ -162,6 +162,7 @@ pub extern "C" fn frontend_stats(doh: &mut DohFrontend, out: &mut Stats) -> bool
             out.connections_accepted = stats.connections_accepted;
             out.alive_connections = stats.alive_connections;
             out.resumed_connections = stats.resumed_connections;
+            out.early_data_connections = stats.early_data_connections;
         })
         .or_else(logging_and_return_err)
         .is_ok()

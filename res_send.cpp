@@ -504,7 +504,7 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
         // asking the same question will block for PENDING_REQUEST_TIMEOUT seconds instead
         // of failing fast.
         _resolv_cache_query_failed(statp->netid, msg, flags);
-
+        LOG(DEBUG) << __func__ << ": no nameserver";
         // TODO: Remove errno once callers stop using it
         errno = ESRCH;
         return -ESRCH;
@@ -526,6 +526,7 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
         }
         if (!fallback) {
             _resolv_cache_query_failed(statp->netid, msg, flags);
+            LOG(DEBUG) << __func__ << ": private DNS failed";
             return -ETIMEDOUT;
         }
     }
@@ -540,6 +541,7 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
     res_params params;
     int revision_id = resolv_cache_get_resolver_stats(statp->netid, &params, stats, statp->nsaddrs);
     if (revision_id < 0) {
+        LOG(ERROR) << __func__ << ": revision_id < 0";
         // TODO: Remove errno once callers stop using it
         errno = ESRCH;
         return -ESRCH;
@@ -1454,9 +1456,7 @@ int res_tls_send(const std::list<DnsTlsServer>& tlsServers, ResState* statp, con
             // It's OPPORTUNISTIC mode,
             // hence it's not required to do anything because it'll fallback to UDP.
             case DnsTlsTransport::Response::network_error:
-                [[fallthrough]];
             case DnsTlsTransport::Response::internal_error:
-                [[fallthrough]];
             default:
                 return -1;
         }
