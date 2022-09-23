@@ -16,14 +16,17 @@ cc_test_library {
     header_libs: [
         "libnetd_resolv_headers",
     ],
-    shared_libs: [
-        "libutils",
-    ],
     static_libs: [
         "netd_aidl_interface-lateststable-ndk",
+        "libconnectivity_native_test_utils",
+        "libmodules-utils-build",
         "libnetd_test_dnsresponder_ndk",
         "libnetdutils",
         "libgmock",
+    ],
+    export_static_lib_headers: [
+        "libconnectivity_native_test_utils",
+        "libmodules-utils-build",
     ],
 }
 
@@ -117,9 +120,17 @@ cc_test {
         "server_configurable_flags",
         "stats_proto",
     ],
-    // MTS test binary can't be built under compile_multilib = "both" and having test data.
-    // However, MTS coverage requires 32 bit test binary to run.
-    compile_multilib: "prefer32",
+    // TODO: Remove multilib after coverage test switched to 64-bit device.
+    // See comments in target "resolv_test_mts_coverage_defaults".
+    compile_multilib: "both",
+    multilib: {
+        lib32: {
+            suffix: "32",
+        },
+        lib64: {
+            suffix: "64",
+        },
+    },
 }
 
 cc_test {
@@ -146,7 +157,6 @@ cc_test {
         "libnetd_test_dnsresponder_ndk",
         "libnetd_test_resolv_utils",
         "libnetdutils",
-        "libutils",
         "netd_event_listener_interface-lateststable-ndk",
         "netd_aidl_interface-lateststable-ndk",
     ],
@@ -181,6 +191,7 @@ cc_test {
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
+        "libconnectivity_native_test_utils",
         "libcrypto_static",
         "libgmock",
         "libmodules-utils-build",
@@ -189,7 +200,7 @@ cc_test {
         "libnetd_test_resolv_utils",
         "libnetdutils",
         "libssl",
-        "libutils",
+        "libcutils",
         "netd_aidl_interface-lateststable-ndk",
         "netd_event_listener_interface-lateststable-ndk",
         "libip_checksum",
@@ -252,7 +263,6 @@ cc_test {
         "libstatslog_resolv",
         "libstatspush_compat",
         "libsysutils",
-        "libutils",
         "resolv_stats_test_utils",
         "server_configurable_flags",
         "stats_proto",
@@ -287,6 +297,7 @@ cc_test {
     test_suites: ["general-tests"],
     static_libs: [
         "libgmock",
+        "libnetdutils",
         "libprotobuf-cpp-lite",
         "resolv_stats_test_utils",
         "stats_proto",
@@ -297,8 +308,14 @@ cc_test {
     name: "doh_ffi_test",
     test_suites: [
         "general-tests",
+        "mts-dnsresolver",
     ],
-    defaults: ["netd_defaults"],
+    defaults: [
+        "connectivity-mainline-presubmit-cc-defaults",
+        "netd_defaults",
+        "resolv_test_defaults",
+        "resolv_test_mts_coverage_defaults",
+    ],
     header_libs: [
         "libnetd_resolv_internal_headers",
     ],
@@ -307,11 +324,69 @@ cc_test {
         "libcrypto_static",
         "libdoh_ffi_for_test",
         "libgmock",
-        "liblog",
+        "libnetdutils",
         "libssl",
     ],
     shared_libs: [
         "libnetd_client",
     ],
-    min_sdk_version: "29",
+}
+
+cc_defaults {
+    name: "resolv_fuzzer_defaults",
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+    ],
+    srcs: [
+        "doh_frontend.cpp",
+    ],
+    header_libs: [
+        "libnetd_resolv_headers",
+        "dnsproxyd_protocol_headers",
+    ],
+    shared_libs: [
+        "libbinder_ndk",
+    ],
+    static_libs: [
+        "dnsresolver_aidl_interface-lateststable-ndk",
+        "libcrypto_static",
+        "libdoh_fuzz_ffi",
+        "libgtest",
+        "libnetdutils",
+        "libnetd_resolv",
+        "libnetd_test_dnsresponder_ndk",
+        "libnetd_test_resolv_utils",
+        "libprotobuf-cpp-lite",
+        "libssl",
+        "libsysutils",
+        "netd_aidl_interface-lateststable-ndk",
+        "netd_event_listener_interface-lateststable-ndk",
+        "server_configurable_flags",
+        "stats_proto",
+    ],
+    fuzz_config: {
+       cc: [
+            "cken@google.com",
+            "kfcchen@google.com",
+       ],
+    },
+}
+
+cc_fuzz {
+    name: "resolv_gethostbyname_fuzzer",
+    defaults: ["resolv_fuzzer_defaults"],
+    srcs: ["fuzzer/resolv_gethostbyname_fuzzer.cpp"],
+}
+
+cc_fuzz {
+    name: "resolv_gethostbyaddr_fuzzer",
+    defaults: ["resolv_fuzzer_defaults"],
+    srcs: ["fuzzer/resolv_gethostbyaddr_fuzzer.cpp"],
+}
+
+cc_fuzz {
+    name: "resolv_getaddrinfo_fuzzer",
+    defaults: ["resolv_fuzzer_defaults"],
+    srcs: ["fuzzer/resolv_getaddrinfo_fuzzer.cpp"],
 }
