@@ -147,7 +147,8 @@ static struct addrinfo* _gethtent(FILE**, const char*, const struct addrinfo*);
 static struct addrinfo* getCustomHosts(const size_t netid, const char*, const struct addrinfo*);
 static bool files_getaddrinfo(const size_t netid, const char* name, const addrinfo* pai,
                               addrinfo** res);
-static int _find_src_addr(const struct sockaddr*, struct sockaddr*, unsigned, uid_t);
+static int _find_src_addr(const struct sockaddr*, struct sockaddr*, unsigned, uid_t,
+                          bool allow_v6_linklocal);
 
 static int res_queryN(const char* name, res_target* target, ResState* res, int* herrno);
 static int res_searchN(const char* name, res_target* target, ResState* res, int* herrno);
@@ -220,13 +221,14 @@ void freeaddrinfo(struct addrinfo* ai) {
  * on the local system". However, bionic doesn't currently support getifaddrs,
  * so checking for connectivity is the next best thing.
  */
-static int have_ipv6(unsigned mark, uid_t uid) {
+static int have_ipv6(unsigned mark, uid_t uid, bool mdns) {
     static const struct sockaddr_in6 sin6_test = {
             .sin6_family = AF_INET6,
             .sin6_addr.s6_addr = {// 2000::
                                   0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}};
     sockaddr_union addr = {.sin6 = sin6_test};
-    return _find_src_addr(&addr.sa, NULL, mark, uid) == 1;
+    sockaddr sa;
+    return _find_src_addr(&addr.sa, &sa, mark, uid, /*allow_v6_linklocal=*/mdns) == 1;
 }
 
 static int have_ipv4(unsigned mark, uid_t uid) {
@@ -235,7 +237,8 @@ static int have_ipv4(unsigned mark, uid_t uid) {
             .sin_addr.s_addr = __constant_htonl(0x08080808L)  // 8.8.8.8
     };
     sockaddr_union addr = {.sin = sin_test};
-    return _find_src_addr(&addr.sa, NULL, mark, uid) == 1;
+    sockaddr sa;
+    return _find_src_addr(&addr.sa, &sa, mark, uid, /*(don't care) allow_v6_linklocal=*/false) == 1;
 }
 
 // Internal version of getaddrinfo(), but limited to AI_NUMERICHOST.
@@ -1256,7 +1259,8 @@ static int _rfc6724_compare(const void* ptr1, const void* ptr2) {
 
 /*
  * Find the source address that will be used if trying to connect to the given
- * address. src_addr must be large enough to hold a struct sockaddr_in6.
+ * address. src_addr must be assigned and large enough to hold a struct sockaddr_in6.
+ * allow_v6_linklocal controls whether to accept link-local source addresses.
  *
  * Returns 1 if a source address was found, 0 if the address is unreachable,
  * and -1 if a fatal error occurred. If 0 or -1, the contents of src_addr are
@@ -1264,25 +1268,33 @@ static int _rfc6724_compare(const void* ptr1, const void* ptr2) {
  */
 
 static int _find_src_addr(const struct sockaddr* addr, struct sockaddr* src_addr, unsigned mark,
-                          uid_t uid) {
-    int sock;
+                          uid_t uid, bool allow_v6_linklocal) {
+    if (src_addr == nullptr) {
+        LOG(DEBUG) << __func__ << ": src_addr==nullptr";
+        return -1;
+    }
+
     int ret;
     socklen_t len;
 
     switch (addr->sa_family) {
         case AF_INET:
+            LOG(DEBUG) << __func__ << ": sa_family AF_INET";
             len = sizeof(struct sockaddr_in);
             break;
         case AF_INET6:
+            LOG(DEBUG) << __func__ << ": sa_family AF_INET6";
             len = sizeof(struct sockaddr_in6);
             break;
         default:
             /* No known usable source address for non-INET families. */
+            LOG(DEBUG) << __func__ << ": non-INET families " << addr->sa_family;
             return 0;
     }
 
-    sock = socket(addr->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
-    if (sock == -1) {
+    android::base::unique_fd sock(socket(addr->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP));
+    if (sock.get() == -1) {
+        LOG(DEBUG) << __func__ << ": sock() error, " << strerror(errno);
         if (errno == EAFNOSUPPORT) {
             return 0;
         } else {
@@ -1290,11 +1302,11 @@ static int _find_src_addr(const struct sockaddr* addr, struct sockaddr* src_addr
         }
     }
     if (mark != MARK_UNSET && setsockopt(sock, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0) {
-        close(sock);
+        LOG(DEBUG) << __func__ << ": setsockopt() error, " << strerror(errno);
         return 0;
     }
     if (uid > 0 && uid != NET_CONTEXT_INVALID_UID && fchown(sock, uid, (gid_t) -1) < 0) {
-        close(sock);
+        LOG(DEBUG) << __func__ << ": fchown() error, " << strerror(errno);
         return 0;
     }
     do {
@@ -1302,15 +1314,25 @@ static int _find_src_addr(const struct sockaddr* addr, struct sockaddr* src_addr
     } while (ret == -1 && errno == EINTR);
 
     if (ret == -1) {
-        close(sock);
+        LOG(DEBUG) << __func__ << ": connect() return -1, " << strerror(errno);
         return 0;
     }
 
-    if (src_addr && getsockname(sock, src_addr, &len) == -1) {
-        close(sock);
+    if (getsockname(sock, src_addr, &len) == -1) {
+        LOG(DEBUG) << __func__ << ": getsockname() return -1, " << strerror(errno);
         return -1;
     }
-    close(sock);
+
+    if (src_addr->sa_family == AF_INET6) {
+        sockaddr_in6* sin6 = reinterpret_cast<sockaddr_in6*>(src_addr);
+        if (!allow_v6_linklocal && IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
+            LOG(DEBUG) << __func__ << ": !allow_v6_linklocal && IN6_IS_ADDR_LINKLOCAL";
+            return 0;
+        }
+        LOG(DEBUG) << __func__ << ": AF_INET6. allow_v6_linklocal=" << allow_v6_linklocal
+                   << " IN6_IS_ADDR_LINKLOCAL=" << IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr);
+    }
+    LOG(DEBUG) << __func__ << ": return 1";
     return 1;
 }
 
@@ -1332,7 +1354,7 @@ void resolv_rfc6724_sort(struct addrinfo* list_sentinel, unsigned mark, uid_t ui
         cur = cur->ai_next;
     }
 
-    elems = (struct addrinfo_sort_elem*) malloc(nelem * sizeof(struct addrinfo_sort_elem));
+    elems = (struct addrinfo_sort_elem*) calloc(nelem, sizeof(struct addrinfo_sort_elem));
     if (elems == NULL) {
         goto error;
     }
@@ -1347,7 +1369,8 @@ void resolv_rfc6724_sort(struct addrinfo* list_sentinel, unsigned mark, uid_t ui
         elems[i].ai = cur;
         elems[i].original_order = i;
 
-        has_src_addr = _find_src_addr(cur->ai_addr, &elems[i].src_addr.sa, mark, uid);
+        has_src_addr = _find_src_addr(cur->ai_addr, &elems[i].src_addr.sa, mark, uid,
+                                      /*allow_v6_linklocal=*/true);
         if (has_src_addr == -1) {
             goto error;
         }
@@ -1372,6 +1395,8 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
                            NetworkDnsEventReported* event) {
     res_target q = {};
     res_target q2 = {};
+    ResState res(netcontext, event);
+    setMdnsFlag(name, res.netid, &(res.flags));
 
     switch (pai->ai_family) {
         case AF_UNSPEC: {
@@ -1380,7 +1405,8 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
             q.qclass = C_IN;
             int query_ipv6 = 1, query_ipv4 = 1;
             if (pai->ai_flags & AI_ADDRCONFIG) {
-                query_ipv6 = have_ipv6(netcontext->app_mark, netcontext->uid);
+                query_ipv6 = have_ipv6(netcontext->app_mark, netcontext->uid,
+                                       isMdnsResolution(res.flags));
                 query_ipv4 = have_ipv4(netcontext->app_mark, netcontext->uid);
             }
             if (query_ipv6) {
@@ -1411,10 +1437,6 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
         default:
             return EAI_FAMILY;
     }
-
-    ResState res(netcontext, event);
-
-    setMdnsFlag(name, res.netid, &(res.flags));
 
     int he;
     if (res_searchN(name, &q, &res, &he) < 0) {

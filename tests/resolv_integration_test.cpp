@@ -83,24 +83,6 @@ constexpr int MAXPACKET = (8 * 1024);
 constexpr int RES_TIMEOUT = 5000; /* min. milliseconds between retries */
 constexpr int RES_DFLRETRY = 2;   /* Default #/tries. */
 
-const std::string kSortNameserversFlag("persist.device_config.netd_native.sort_nameservers");
-const std::string kDotConnectTimeoutMsFlag(
-        "persist.device_config.netd_native.dot_connect_timeout_ms");
-const std::string kDotAsyncHandshakeFlag("persist.device_config.netd_native.dot_async_handshake");
-const std::string kDotMaxretriesFlag("persist.device_config.netd_native.dot_maxtries");
-const std::string kDotRevalidationThresholdFlag(
-        "persist.device_config.netd_native.dot_revalidation_threshold");
-const std::string kDotXportUnusableThresholdFlag(
-        "persist.device_config.netd_native.dot_xport_unusable_threshold");
-const std::string kDotQueryTimeoutMsFlag("persist.device_config.netd_native.dot_query_timeout_ms");
-const std::string kDotValidationLatencyFactorFlag(
-        "persist.device_config.netd_native.dot_validation_latency_factor");
-const std::string kDotValidationLatencyOffsetMsFlag(
-        "persist.device_config.netd_native.dot_validation_latency_offset_ms");
-const std::string kDotQuickFallbackFlag("persist.device_config.netd_native.dot_quick_fallback");
-const std::string kRetransIntervalFlag(
-        "persist.device_config.netd_native.retransmission_time_interval");
-const std::string kRetryCountFlag("persist.device_config.netd_native.retry_count");
 // Semi-public Bionic hook used by the NDK (frameworks/base/native/android/net.c)
 // Tested here for convenience.
 extern "C" int android_getaddrinfofornet(const char* hostname, const char* servname,
@@ -901,6 +883,39 @@ TEST_F(ResolverTest, GetAddrInfoV4_deferred_resp) {
     t3.join();
     t1.join();
     t2.join();
+}
+
+TEST_F(ResolverTest, GetAddrInfoV4_MultiAnswers) {
+    test::DNSResponder dns(test::DNSResponder::MappingType::BINARY_PACKET);
+    dns.addMappingBinaryPacket(kHelloExampleComQueryV4, kHelloExampleComResponsesV4);
+    StartDns(dns, {});
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    const addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM};
+    ScopedAddrinfo result = safe_getaddrinfo(kHelloExampleCom, nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+
+    // Expect the DNS result order is the same as the RR order in the DNS response
+    // |kHelloExampleComResponsesV4| because none of rule in the native sorting
+    // function _rfc6724_compare() is matched.
+    //
+    // The reason is here for the sorting result from _rfc6724_compare.
+    // For rule 1: avoid unusable destinations, all addresses are unusable on a fake test network.
+    // For rule 2: prefer matching scope, all addresses don't match because of no source address.
+    //             See rule#1 as well.
+    // (rule 3 is not implemented)
+    // (rule 4 is not implemented)
+    // For rule 5: prefer matching label, all addresses get the same label 4 for AF_INET.
+    // For rule 6: prefer higher precedence, all addresses get the same precedence 35 for AF_INET.
+    // (rule 7 is not implemented)
+    // For rule 8: prefer smaller scope, all destination addresses has the same scope.
+    // For rule 9: use longest matching prefix, IPv6 only.
+    // For rule 10: leave the order unchanged, these IPv4 DNS addresses meet this rule.
+    //
+    // See packages/modules/DnsResolver/getaddrinfo.cpp
+    EXPECT_THAT(ToStrings(result),
+                testing::ElementsAre(kHelloExampleComAddrV4, kHelloExampleComAddrV4_2,
+                                     kHelloExampleComAddrV4_3));
 }
 
 TEST_F(ResolverTest, GetAddrInfo_cnames) {
@@ -3071,50 +3086,6 @@ TEST_F(ResolverTest, GetAddrInfo_Dns64Synthesize) {
 // TODO: merge to #GetAddrInfo_Dns64Synthesize once DNSResponder supports multi DnsRecords for a
 // hostname.
 TEST_F(ResolverTest, GetAddrInfo_Dns64SynthesizeMultiAnswers) {
-    const std::vector<uint8_t> kHelloExampleComResponsesV4 = {
-            // scapy.DNS(
-            //   id=0,
-            //   qr=1,
-            //   ra=1,
-            //   qd=scapy.DNSQR(qname="hello.example.com",qtype="A"),
-            //   an=scapy.DNSRR(rrname="hello.example.com",type="A",ttl=0,rdata='1.2.3.4') /
-            //      scapy.DNSRR(rrname="hello.example.com",type="A",ttl=0,rdata='8.8.8.8') /
-            //      scapy.DNSRR(rrname="hello.example.com",type="A",ttl=0,rdata='81.117.21.202'))
-            /* Header */
-            0x00, 0x00, /* Transaction ID: 0x0000 */
-            0x81, 0x80, /* Flags: qr rd ra */
-            0x00, 0x01, /* Questions: 1 */
-            0x00, 0x03, /* Answer RRs: 3 */
-            0x00, 0x00, /* Authority RRs: 0 */
-            0x00, 0x00, /* Additional RRs: 0 */
-            /* Queries */
-            0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x07, 0x65, 0x78, 0x61, 0x6D, 0x70, 0x6C, 0x65,
-            0x03, 0x63, 0x6F, 0x6D, 0x00, /* Name: hello.example.com */
-            0x00, 0x01,                   /* Type: A */
-            0x00, 0x01,                   /* Class: IN */
-            0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
-            0x03, 0x63, 0x6f, 0x6d, 0x00, /* Name: hello.example.com */
-            0x00, 0x01,                   /* Type: A */
-            0x00, 0x01,                   /* Class: IN */
-            0x00, 0x00, 0x00, 0x00,       /* Time to live: 0 */
-            0x00, 0x04,                   /* Data length: 4 */
-            0x01, 0x02, 0x03, 0x04,       /* Address: 1.2.3.4 */
-            0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
-            0x03, 0x63, 0x6f, 0x6d, 0x00, /* Name: hello.example.com */
-            0x00, 0x01,                   /* Type: A */
-            0x00, 0x01,                   /* Class: IN */
-            0x00, 0x00, 0x00, 0x00,       /* Time to live: 0 */
-            0x00, 0x04,                   /* Data length: 4 */
-            0x08, 0x08, 0x08, 0x08,       /* Address: 8.8.8.8 */
-            0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
-            0x03, 0x63, 0x6f, 0x6d, 0x00, /* Name: hello.example.com */
-            0x00, 0x01,                   /* Type: A */
-            0x00, 0x01,                   /* Class: IN */
-            0x00, 0x00, 0x00, 0x00,       /* Time to live: 0 */
-            0x00, 0x04,                   /* Data length: 4 */
-            0x51, 0x75, 0x15, 0xca        /* Address: 81.117.21.202 */
-    };
-
     test::DNSResponder dns(test::DNSResponder::MappingType::BINARY_PACKET);
     dns.addMappingBinaryPacket(kHelloExampleComQueryV4, kHelloExampleComResponsesV4);
     StartDns(dns, {});
@@ -6907,6 +6878,15 @@ class ResolverMultinetworkTest : public ResolverTest {
             }
             return {};
         }
+        const std::string& ifname() { return mIfname; }
+        // Assuming mNetId is unique during ResolverMultinetworkTest, make the
+        // address based on it to avoid conflicts.
+        std::string makeIpv4AddrString(uint8_t n) const {
+            return fmt::format("192.168.{}.{}", (mNetId - TEST_NETID_BASE), n);
+        }
+        std::string makeIpv6AddrString(uint8_t n) const {
+            return fmt::format("2001:db8:{}::{}", (mNetId - TEST_NETID_BASE), n);
+        }
 
       protected:
         // Subclasses should implement it to decide which network should be create.
@@ -6923,14 +6903,6 @@ class ResolverMultinetworkTest : public ResolverTest {
 
       private:
         Result<DnsServerPair> addDns(ConnectivityType connectivity);
-        // Assuming mNetId is unique during ResolverMultinetworkTest, make the
-        // address based on it to avoid conflicts.
-        std::string makeIpv4AddrString(uint8_t n) const {
-            return fmt::format("192.168.{}.{}", (mNetId - TEST_NETID_BASE), n);
-        }
-        std::string makeIpv6AddrString(uint8_t n) const {
-            return fmt::format("2001:db8:{}::{}", (mNetId - TEST_NETID_BASE), n);
-        }
     };
 
     class ScopedPhysicalNetwork : public ScopedNetwork {
@@ -7573,6 +7545,100 @@ TEST_F(ResolverMultinetworkTest, PerAppDefaultNetwork) {
         expectDnsQueryCountsFn(*appDefaultNwDnsSv, host_name, expectedDnsReply.size(),
                                appDefaultNetId);
     }
+}
+
+// Do not send AAAA query when IPv6 address is link-local with a default route.
+TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRoute) {
+    constexpr char host_name[] = "ohayou.example.com.";
+    ScopedPhysicalNetwork network = CreateScopedPhysicalNetwork(ConnectivityType::V4);
+    ASSERT_RESULT_OK(network.init());
+
+    // Add IPv6 default route
+    ASSERT_TRUE(mDnsClient.netdService()
+                        ->networkAddRoute(network.netId(), network.ifname(), "::/0", "")
+                        .isOk());
+
+    const Result<DnsServerPair> dnsPair = network.addIpv4Dns();
+    ASSERT_RESULT_OK(dnsPair);
+    StartDns(*dnsPair->dnsServer, {{host_name, ns_type::ns_t_a, "192.0.2.0"},
+                                   {host_name, ns_type::ns_t_aaaa, "2001:db8:cafe:d00d::31"}});
+
+    ASSERT_TRUE(network.setDnsConfiguration());
+    ASSERT_TRUE(network.startTunForwarder());
+
+    auto result = android_getaddrinfofornet_wrapper(host_name, network.netId());
+    ASSERT_RESULT_OK(result);
+    ScopedAddrinfo ai_result(std::move(result.value()));
+    EXPECT_EQ(ToString(ai_result), "192.0.2.0");
+    EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 1U);
+    EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name), 0U);
+
+    EXPECT_TRUE(mDnsClient.resolvService()->flushNetworkCache(network.netId()).isOk());
+    dnsPair->dnsServer->clearQueries();
+
+    // Add an IPv6 global address. Resolver starts issuing AAAA queries as well as A queries.
+    const std::string v6Addr = network.makeIpv6AddrString(1);
+    EXPECT_TRUE(
+            mDnsClient.netdService()->interfaceAddAddress(network.ifname(), v6Addr, 128).isOk());
+    result = android_getaddrinfofornet_wrapper(host_name, network.netId());
+    ASSERT_RESULT_OK(result);
+    ScopedAddrinfo ai_results(std::move(result.value()));
+    std::vector<std::string> result_strs = ToStrings(ai_results);
+    EXPECT_THAT(result_strs,
+                testing::UnorderedElementsAreArray({"192.0.2.0", "2001:db8:cafe:d00d::31"}));
+    EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 1U);
+    EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name), 1U);
+}
+
+// v6 mdns is expected to be sent when the IPv6 address is a link-local with a default route.
+TEST_F(ResolverMultinetworkTest, MdnsIPv6LinkLocalWithDefaultRoute) {
+    constexpr char v6addr[] = "::127.0.0.3";
+    constexpr char v4addr[] = "127.0.0.3";
+    constexpr char host_name[] = "hello.local.";
+
+    // TODO: remove debugging log when b/247693272 is clarified.
+    ASSERT_TRUE(mDnsClient.resolvService()
+                        ->setLogSeverity(aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_DEBUG)
+                        .isOk());
+
+    ScopedPhysicalNetwork network = CreateScopedPhysicalNetwork(ConnectivityType::V4);
+    ASSERT_RESULT_OK(network.init());
+
+    // Add IPv6 default route
+    ASSERT_TRUE(mDnsClient.netdService()
+                        ->networkAddRoute(network.netId(), network.ifname(), "::/0", "")
+                        .isOk());
+
+    const Result<DnsServerPair> dnsPair = network.addIpv4Dns();
+    ASSERT_RESULT_OK(dnsPair);
+    StartDns(*dnsPair->dnsServer, {});
+
+    ASSERT_TRUE(network.setDnsConfiguration());
+    ASSERT_TRUE(network.startTunForwarder());
+
+    test::DNSResponder mdnsv4("127.0.0.3", test::kDefaultMdnsListenService);
+    test::DNSResponder mdnsv6("::1", test::kDefaultMdnsListenService);
+    mdnsv4.setNetwork(network.netId());
+    mdnsv6.setNetwork(network.netId());
+    StartDns(mdnsv4, {{host_name, ns_type::ns_t_a, v4addr}});
+    StartDns(mdnsv6, {{host_name, ns_type::ns_t_aaaa, v6addr}});
+
+    auto result = android_getaddrinfofornet_wrapper("hello.local", network.netId());
+    ASSERT_RESULT_OK(result);
+    ScopedAddrinfo ai_result(std::move(result.value()));
+    EXPECT_THAT(ToStrings(ai_result), testing::UnorderedElementsAreArray({v4addr, v6addr}));
+
+    // make sure queries were sent & received via mdns.
+    EXPECT_EQ(GetNumQueries(mdnsv4, host_name), 1U);
+    EXPECT_EQ(GetNumQueries(mdnsv6, host_name), 1U);
+    EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 0U);
+    EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name), 0U);
+
+    // Reset logging level to "default" without checking the previous logging level, since no
+    // public function to get current level, and it's for temporary debugging only.
+    ASSERT_TRUE(mDnsClient.resolvService()
+                        ->setLogSeverity(aidl::android::net::IDnsResolver::DNS_RESOLVER_LOG_INFO)
+                        .isOk());
 }
 
 TEST_F(ResolverTest, NegativeValueInExperimentFlag) {
