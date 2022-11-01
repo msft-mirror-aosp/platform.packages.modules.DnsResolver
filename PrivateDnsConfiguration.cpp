@@ -61,7 +61,7 @@ bool ensureNoInvalidIp(const std::vector<std::string>& servers) {
 
 }  // namespace
 
-PrivateDnsModes convert_enum_type(PrivateDnsMode mode) {
+PrivateDnsModes convertEnumType(PrivateDnsMode mode) {
     switch (mode) {
         case PrivateDnsMode::OFF:
             return PrivateDnsModes::PDM_OFF;
@@ -158,12 +158,16 @@ void PrivateDnsConfiguration::clearDot(int32_t netId) {
 }
 
 PrivateDnsStatus PrivateDnsConfiguration::getStatus(unsigned netId) const {
+    std::lock_guard guard(mPrivateDnsLock);
+    return getStatusLocked(netId);
+}
+
+PrivateDnsStatus PrivateDnsConfiguration::getStatusLocked(unsigned netId) const {
     PrivateDnsStatus status{
             .mode = PrivateDnsMode::OFF,
             .dotServersMap = {},
             .dohServersMap = {},
     };
-    std::lock_guard guard(mPrivateDnsLock);
 
     const auto mode = mPrivateDnsModes.find(netId);
     if (mode == mPrivateDnsModes.end()) return status;
@@ -189,19 +193,19 @@ PrivateDnsStatus PrivateDnsConfiguration::getStatus(unsigned netId) const {
 }
 
 NetworkDnsServerSupportReported PrivateDnsConfiguration::getStatusForMetrics(unsigned netId) const {
-    NetworkDnsServerSupportReported event;
-    {
-        std::lock_guard guard(mPrivateDnsLock);
-        if (const auto it = mPrivateDnsModes.find(netId); it != mPrivateDnsModes.end()) {
-            event.set_private_dns_modes(convert_enum_type(it->second));
-        } else {
-            return event;
-        }
-    }
-    event.set_network_type(resolv_get_network_types_for_net(netId));
-
-    const PrivateDnsStatus status = getStatus(netId);
+    const auto networkType = resolv_get_network_types_for_net(netId);
     std::lock_guard guard(mPrivateDnsLock);
+
+    if (mPrivateDnsModes.find(netId) == mPrivateDnsModes.end()) {
+        // Return NetworkDnsServerSupportReported with private_dns_modes set to PDM_UNKNOWN.
+        return {};
+    }
+
+    const PrivateDnsStatus status = getStatusLocked(netId);
+    NetworkDnsServerSupportReported event = {};
+    event.set_network_type(networkType);
+    event.set_private_dns_modes(convertEnumType(status.mode));
+
     if (const auto it = mUnorderedDnsTracker.find(netId); it != mUnorderedDnsTracker.end()) {
         for (size_t i = 0; i < it->second.size(); i++) {
             Server* server = event.mutable_servers()->add_server();
