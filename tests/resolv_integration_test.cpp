@@ -4627,7 +4627,7 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout) {
         EXPECT_EQ(1U, GetNumQueries(dns, hostname2));
         EXPECT_EQ(records.at(1).addr, ToString(result));
 
-        EXPECT_LE(timeTakenMs, 200);
+        EXPECT_LE(timeTakenMs, 1000);
     }
 
     // TODO: Remove it after b/254186357 is clarified.
@@ -7664,6 +7664,48 @@ TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRoute) {
                 testing::UnorderedElementsAreArray({"192.0.2.0", "2001:db8:cafe:d00d::31"}));
     EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 1U);
     EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name), 1U);
+}
+
+// Test if the "do not send AAAA query when IPv6 address is link-local with a default route" feature
+// can be toggled by flag.
+TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRouteFlag) {
+    constexpr char host_name[] = "ohayou.example.com.";
+    const struct TestConfig {
+        std::string flagValue;
+        std::vector<std::string> ips;
+        unsigned numOfQuadAQuery;
+    } TestConfigs[]{{"0", {"192.0.2.0", "2001:db8:cafe:d00d::31"}, 1U}, {"1", {"192.0.2.0"}, 0U}};
+
+    for (const auto& config : TestConfigs) {
+        SCOPED_TRACE(fmt::format("flagValue = {}, numOfQuadAQuery = {}", config.flagValue,
+                                 config.numOfQuadAQuery));
+
+        ScopedSystemProperties sp1(kSkip4aQueryOnV6LinklocalAddrFlag, config.flagValue);
+        ScopedPhysicalNetwork network = CreateScopedPhysicalNetwork(ConnectivityType::V4);
+        ASSERT_RESULT_OK(network.init());
+
+        // Add IPv6 default route
+        ASSERT_TRUE(mDnsClient.netdService()
+                            ->networkAddRoute(network.netId(), network.ifname(), "::/0", "")
+                            .isOk());
+
+        const Result<DnsServerPair> dnsPair = network.addIpv4Dns();
+        ASSERT_RESULT_OK(dnsPair);
+        StartDns(*dnsPair->dnsServer, {{host_name, ns_type::ns_t_a, "192.0.2.0"},
+                                       {host_name, ns_type::ns_t_aaaa, "2001:db8:cafe:d00d::31"}});
+
+        ASSERT_TRUE(network.setDnsConfiguration());
+        ASSERT_TRUE(network.startTunForwarder());
+
+        auto result = android_getaddrinfofornet_wrapper(host_name, network.netId());
+        ASSERT_RESULT_OK(result);
+        ScopedAddrinfo ai_results(std::move(result.value()));
+        std::vector<std::string> result_strs = ToStrings(ai_results);
+        EXPECT_THAT(result_strs, testing::UnorderedElementsAreArray(config.ips));
+        EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 1U);
+        EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name),
+                  config.numOfQuadAQuery);
+    }
 }
 
 // v6 mdns is expected to be sent when the IPv6 address is a link-local with a default route.
