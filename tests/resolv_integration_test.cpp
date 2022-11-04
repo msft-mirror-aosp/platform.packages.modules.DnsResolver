@@ -947,6 +947,122 @@ TEST_F(ResolverTest, GetAddrInfoV4_MultiAnswers) {
                                      kHelloExampleComAddrV4_2, kHelloExampleComAddrV4_3));
 }
 
+TEST_F(ResolverTest, GetAddrInfoV6_MultiAnswers) {
+    test::DNSResponder dns(test::DNSResponder::MappingType::BINARY_PACKET);
+    dns.addMappingBinaryPacket(kHelloExampleComQueryV6, kHelloExampleComResponsesV6);
+    StartDns(dns, {});
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM};
+    ScopedAddrinfo result = safe_getaddrinfo(kHelloExampleCom, nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+
+    // Expect the DNS result order is GUA, teredo tunneling address and IPv4-compatible address
+    // because of the precedence comparison of RFC 6724.
+    //
+    // The reason is here for the sorting result from _rfc6724_compare.
+    // For rule 1: avoid unusable destinations, all addresses are unusable on a fake test network.
+    // For rule 2: prefer matching scope, all addresses don't match because of no source address.
+    //             See rule#1 as well.
+    // (rule 3 is not implemented)
+    // (rule 4 is not implemented)
+    // For rule 5: prefer matching label, the source address is not valid and can't match the dns
+    //             reply addresses. See rule#1 as well.
+    // For rule 6: prefer higher precedence, sorted by the order: gua(40), teredo(5) and
+    //             ipv4-compatible(1).
+    // Ignore from rule 7 to rule 10 because the results has been sorted by rule 6.
+    //
+    // See _get_precedence, _rfc6724_compare in packages/modules/DnsResolver/getaddrinfo.cpp
+    EXPECT_THAT(ToStrings(result),
+                testing::ElementsAre(kHelloExampleComAddrV6_GUA, kHelloExampleComAddrV6_TEREDO,
+                                     kHelloExampleComAddrV6_IPV4COMPAT));
+
+    hints = {.ai_family = AF_UNSPEC};
+    result = safe_getaddrinfo(kHelloExampleCom, nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+
+    // The results are sorted in every querying by explore_options and then concatenates all sorted
+    // results. resolv_getaddrinfo() calls explore_fqdn() many times by the different
+    // explore_options. It means that resolv_rfc6724_sort() only sorts the ordering in the results
+    // of each explore_options and concatenates all sorted results into one link list. The address
+    // order of the output addrinfo is:
+    //   2404:6800::5175:15ca (socktype=2, protocol=17) ->
+    //   2001::47c1 (socktype=2, protocol=17) ->
+    //   ::1.2.3.4 (socktype=2, protocol=17) ->
+    //   2404:6800::5175:15ca (socktype=1, protocol=6) ->
+    //   2001::47c1 (socktype=1, protocol=6) ->
+    //   ::1.2.3.4 (socktype=1, protocol=6)
+    //
+    // See resolv_getaddrinfo, explore_fqdn and dns_getaddrinfo.
+    EXPECT_THAT(
+            ToStrings(result),
+            testing::ElementsAre(kHelloExampleComAddrV6_GUA, kHelloExampleComAddrV6_TEREDO,
+                                 kHelloExampleComAddrV6_IPV4COMPAT, kHelloExampleComAddrV6_GUA,
+                                 kHelloExampleComAddrV6_TEREDO, kHelloExampleComAddrV6_IPV4COMPAT));
+}
+
+TEST_F(ResolverTest, GetAddrInfoV4V6_MultiAnswers) {
+    test::DNSResponder dns(test::DNSResponder::MappingType::BINARY_PACKET);
+    // Use one IPv4 address only because we can't control IPv4 address ordering in this test
+    // which uses a fake network.
+    dns.addMappingBinaryPacket(kHelloExampleComQueryV4, kHelloExampleComResponseV4);
+    dns.addMappingBinaryPacket(kHelloExampleComQueryV6, kHelloExampleComResponsesV6);
+    StartDns(dns, {});
+    ASSERT_TRUE(mDnsClient.SetResolversForNetwork());
+
+    addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM};
+    ScopedAddrinfo result = safe_getaddrinfo(kHelloExampleCom, nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+
+    // Expect the DNS result order is ipv6 global unicast address, IPv4 address, IPv6 teredo
+    // tunneling address and IPv4-compatible IPv6 address because of the precedence comparison
+    // of RFC 6724.
+    //
+    // The reason is here for the sorting result from _rfc6724_compare.
+    // For rule 1: avoid unusable destinations, all addresses are unusable on a fake test network.
+    // For rule 2: prefer matching scope, all addresses don't match because of no source address.
+    //             See rule#1 as well.
+    // (rule 3 is not implemented)
+    // (rule 4 is not implemented)
+    // For rule 5: prefer matching label, the source address is not valid and can't match the dns
+    //             reply addresses. See rule#1 as well.
+    // For rule 6: prefer higher precedence, sorted by the order: gua(40), ipv4(35), teredo(5) and
+    //             ipv4-compatible(1).
+    // Ignore from rule 7 to rule 10 because the results has been sorted by rule 6.
+    //
+    // See _get_precedence, _rfc6724_compare in packages/modules/DnsResolver/getaddrinfo.cpp
+    EXPECT_THAT(
+            ToStrings(result),
+            testing::ElementsAre(kHelloExampleComAddrV6_GUA, kHelloExampleComAddrV4,
+                                 kHelloExampleComAddrV6_TEREDO, kHelloExampleComAddrV6_IPV4COMPAT));
+
+    hints = {.ai_family = AF_UNSPEC};
+    result = safe_getaddrinfo(kHelloExampleCom, nullptr, &hints);
+    ASSERT_FALSE(result == nullptr);
+
+    // The results are sorted in every querying by explore_options and then concatenates all sorted
+    // results. resolv_getaddrinfo() calls explore_fqdn() many times by the different
+    // explore_options. It means that resolv_rfc6724_sort() only sorts the ordering in the results
+    // of each explore_options and concatenates all sorted results into one link list. The address
+    // order of the output addrinfo is:
+    //   2404:6800::5175:15ca (socktype=2, protocol=17) ->
+    //   1.2.3.4 (socktype=2, protocol=17) ->
+    //   2001::47c1 (socktype=2, protocol=17) ->
+    //   ::1.2.3.4 (socktype=2, protocol=17) ->
+    //   2404:6800::5175:15ca (socktype=1, protocol=6) ->
+    //   1.2.3.4 (socktype=1, protocol=6) ->
+    //   2001::47c1 (socktype=1, protocol=6) ->
+    //   ::1.2.3.4 (socktype=1, protocol=6)
+    //
+    // See resolv_getaddrinfo, explore_fqdn and dns_getaddrinfo.
+    EXPECT_THAT(
+            ToStrings(result),
+            testing::ElementsAre(kHelloExampleComAddrV6_GUA, kHelloExampleComAddrV4,
+                                 kHelloExampleComAddrV6_TEREDO, kHelloExampleComAddrV6_IPV4COMPAT,
+                                 kHelloExampleComAddrV6_GUA, kHelloExampleComAddrV4,
+                                 kHelloExampleComAddrV6_TEREDO, kHelloExampleComAddrV6_IPV4COMPAT));
+}
+
 TEST_F(ResolverTest, GetAddrInfo_cnames) {
     constexpr char host_name[] = "host.example.com.";
     test::DNSResponder dns;
@@ -4511,7 +4627,7 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout) {
         EXPECT_EQ(1U, GetNumQueries(dns, hostname2));
         EXPECT_EQ(records.at(1).addr, ToString(result));
 
-        EXPECT_LE(timeTakenMs, 200);
+        EXPECT_LE(timeTakenMs, 1000);
     }
 
     // TODO: Remove it after b/254186357 is clarified.
@@ -7548,6 +7664,48 @@ TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRoute) {
                 testing::UnorderedElementsAreArray({"192.0.2.0", "2001:db8:cafe:d00d::31"}));
     EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 1U);
     EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name), 1U);
+}
+
+// Test if the "do not send AAAA query when IPv6 address is link-local with a default route" feature
+// can be toggled by flag.
+TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRouteFlag) {
+    constexpr char host_name[] = "ohayou.example.com.";
+    const struct TestConfig {
+        std::string flagValue;
+        std::vector<std::string> ips;
+        unsigned numOfQuadAQuery;
+    } TestConfigs[]{{"0", {"192.0.2.0", "2001:db8:cafe:d00d::31"}, 1U}, {"1", {"192.0.2.0"}, 0U}};
+
+    for (const auto& config : TestConfigs) {
+        SCOPED_TRACE(fmt::format("flagValue = {}, numOfQuadAQuery = {}", config.flagValue,
+                                 config.numOfQuadAQuery));
+
+        ScopedSystemProperties sp1(kSkip4aQueryOnV6LinklocalAddrFlag, config.flagValue);
+        ScopedPhysicalNetwork network = CreateScopedPhysicalNetwork(ConnectivityType::V4);
+        ASSERT_RESULT_OK(network.init());
+
+        // Add IPv6 default route
+        ASSERT_TRUE(mDnsClient.netdService()
+                            ->networkAddRoute(network.netId(), network.ifname(), "::/0", "")
+                            .isOk());
+
+        const Result<DnsServerPair> dnsPair = network.addIpv4Dns();
+        ASSERT_RESULT_OK(dnsPair);
+        StartDns(*dnsPair->dnsServer, {{host_name, ns_type::ns_t_a, "192.0.2.0"},
+                                       {host_name, ns_type::ns_t_aaaa, "2001:db8:cafe:d00d::31"}});
+
+        ASSERT_TRUE(network.setDnsConfiguration());
+        ASSERT_TRUE(network.startTunForwarder());
+
+        auto result = android_getaddrinfofornet_wrapper(host_name, network.netId());
+        ASSERT_RESULT_OK(result);
+        ScopedAddrinfo ai_results(std::move(result.value()));
+        std::vector<std::string> result_strs = ToStrings(ai_results);
+        EXPECT_THAT(result_strs, testing::UnorderedElementsAreArray(config.ips));
+        EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 1U);
+        EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name),
+                  config.numOfQuadAQuery);
+    }
 }
 
 // v6 mdns is expected to be sent when the IPv6 address is a link-local with a default route.
