@@ -61,7 +61,7 @@ bool ensureNoInvalidIp(const std::vector<std::string>& servers) {
 
 }  // namespace
 
-PrivateDnsModes convert_enum_type(PrivateDnsMode mode) {
+PrivateDnsModes convertEnumType(PrivateDnsMode mode) {
     switch (mode) {
         case PrivateDnsMode::OFF:
             return PrivateDnsModes::PDM_OFF;
@@ -193,6 +193,7 @@ PrivateDnsStatus PrivateDnsConfiguration::getStatusLocked(unsigned netId) const 
 }
 
 NetworkDnsServerSupportReported PrivateDnsConfiguration::getStatusForMetrics(unsigned netId) const {
+    const auto networkType = resolv_get_network_types_for_net(netId);
     std::lock_guard guard(mPrivateDnsLock);
 
     if (mPrivateDnsModes.find(netId) == mPrivateDnsModes.end()) {
@@ -202,8 +203,8 @@ NetworkDnsServerSupportReported PrivateDnsConfiguration::getStatusForMetrics(uns
 
     const PrivateDnsStatus status = getStatusLocked(netId);
     NetworkDnsServerSupportReported event = {};
-    event.set_network_type(resolv_get_network_types_for_net(netId));
-    event.set_private_dns_modes(convert_enum_type(status.mode));
+    event.set_network_type(networkType);
+    event.set_private_dns_modes(convertEnumType(status.mode));
 
     if (const auto it = mUnorderedDnsTracker.find(netId); it != mUnorderedDnsTracker.end()) {
         for (size_t i = 0; i < it->second.size(); i++) {
