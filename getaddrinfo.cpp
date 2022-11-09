@@ -67,6 +67,7 @@
 
 #define ANY 0
 
+using android::net::Experiments;
 using android::net::NetworkDnsEventReported;
 
 const char in_addrany[] = {0, 0, 0, 0};
@@ -1312,9 +1313,17 @@ static int _find_src_addr(const struct sockaddr* addr, struct sockaddr* src_addr
         return -1;
     }
 
-    if (src_addr->sa_family == AF_INET6) {
+    if (Experiments::getInstance()->getFlag("skip_4a_query_on_v6_linklocal_addr", 1) &&
+        src_addr->sa_family == AF_INET6) {
         sockaddr_in6* sin6 = reinterpret_cast<sockaddr_in6*>(src_addr);
         if (!allow_v6_linklocal && IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
+            // There is no point in sending an AAAA query because the device does not have a global
+            // IP address. The only thing that can be affected is the hostname "localhost". Devices
+            // with this setting will not be able to get the localhost v6 IP address ::1 via DNS
+            // lookups, which is accessible by host local. But it is expected that a DNS server that
+            // replies to "localhost" in AAAA should also reply in A. So it shouldn't cause issues.
+            // Also, the current behavior will not be changed because hostname “localhost” only gets
+            // 127.0.0.1 per etc/hosts configs.
             return 0;
         }
     }
@@ -1340,7 +1349,7 @@ void resolv_rfc6724_sort(struct addrinfo* list_sentinel, unsigned mark, uid_t ui
         cur = cur->ai_next;
     }
 
-    elems = (struct addrinfo_sort_elem*) malloc(nelem * sizeof(struct addrinfo_sort_elem));
+    elems = (struct addrinfo_sort_elem*) calloc(nelem, sizeof(struct addrinfo_sort_elem));
     if (elems == NULL) {
         goto error;
     }
@@ -1666,8 +1675,8 @@ static int res_queryN_parallel(const char* name, res_target* target, ResState* r
         // Avoiding gateways drop packets if queries are sent too close together
         // Only needed if we have multiple queries in a row.
         if (t->next) {
-            int sleepFlag = android::net::Experiments::getInstance()->getFlag(
-                    "parallel_lookup_sleep_time", SLEEP_TIME_MS);
+            int sleepFlag = Experiments::getInstance()->getFlag("parallel_lookup_sleep_time",
+                                                                SLEEP_TIME_MS);
             if (sleepFlag > 1000) sleepFlag = 1000;
             sleepTimeMs = std::chrono::milliseconds(sleepFlag);
         }
@@ -1697,8 +1706,7 @@ static int res_queryN_parallel(const char* name, res_target* target, ResState* r
 }
 
 static int res_queryN_wrapper(const char* name, res_target* target, ResState* res, int* herrno) {
-    const bool parallel_lookup =
-            android::net::Experiments::getInstance()->getFlag("parallel_lookup_release", 1);
+    const bool parallel_lookup = Experiments::getInstance()->getFlag("parallel_lookup_release", 1);
     if (parallel_lookup) return res_queryN_parallel(name, target, res, herrno);
 
     return res_queryN(name, target, res, herrno);
