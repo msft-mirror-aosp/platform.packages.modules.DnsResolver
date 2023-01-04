@@ -75,6 +75,14 @@
 #include "tests/tun_forwarder.h"
 #include "tests/unsolicited_listener/unsolicited_event_listener.h"
 
+// This mainline module test still needs to be able to run on pre-S devices,
+// and thus may run across pre-4.9 non-eBPF capable devices like the Pixel 2.
+#define SKIP_IF_BPF_NOT_SUPPORTED                           \
+    do {                                                    \
+        if (!android::bpf::isAtLeastKernelVersion(4, 9, 0)) \
+            GTEST_SKIP() << "Skip: bpf is not supported.";  \
+    } while (0)
+
 // Valid VPN netId range is 100 ~ 65535
 constexpr int TEST_VPN_NETID = 65502;
 constexpr int MAXPACKET = (8 * 1024);
@@ -4952,8 +4960,16 @@ TEST_F(ResolverTest, SkipUnusableTlsServer) {
             expectAnswersValid(fd, AF_INET6, kHelloExampleComAddrV6);
         }
 
-        EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1);
-        EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2);
+        if (GetProperty(kDotAsyncHandshakeFlag, "0") == "0") {
+            EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1);
+            EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2);
+        } else {
+            // If the flag dot_async_handshake is set to 1, the DnsResolver will try
+            // DoT connection establishment at most |retries| times.
+            const int retries = std::stoi(GetProperty(kDotMaxretriesFlag, "3"));
+            EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1 * retries);
+            EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2 * retries);
+        }
     }
 }
 
@@ -5592,7 +5608,6 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
     StartDns(dns2, {});
     test::DnsTlsFrontend workableTls(addr1, "853", addr1, "53");
     test::DnsTlsFrontend unresponsiveTls(addr2, "853", addr2, "53");
-    int validationAttemptsToUnresponsiveTls = 1;
     unresponsiveTls.setHangOnHandshakeForTesting(true);
     ASSERT_TRUE(workableTls.startServer());
     ASSERT_TRUE(unresponsiveTls.startServer());
@@ -5608,7 +5623,8 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
     EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
 
     // The validation is still in progress.
-    EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), validationAttemptsToUnresponsiveTls);
+    EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 1);
+    unresponsiveTls.clearConnectionsCount();
 
     static const struct TestConfig {
         std::vector<std::string> tlsServers;
@@ -5630,6 +5646,7 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
         parcel.caCertificate = config.tlsName.empty() ? "" : kCaCert;
 
         const bool dnsModeChanged = (TlsNameLastTime != config.tlsName);
+        bool validationAttemptToUnresponsiveTls = false;
 
         waitForPrivateDnsStateUpdated();
         ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
@@ -5648,7 +5665,7 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
                     // Despite the identical IP address, the server is regarded as a different
                     // server when DnsTlsServer.name is different. The resolver treats it as a
                     // different object and begins the validation process.
-                    validationAttemptsToUnresponsiveTls++;
+                    validationAttemptToUnresponsiveTls = true;
 
                     // This is the limitation from DnsTlsFrontend. DnsTlsFrontend can't operate
                     // concurrently. As soon as there's another connection request,
@@ -5681,9 +5698,14 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
             EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
         }
 
-        EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), validationAttemptsToUnresponsiveTls);
+        if (validationAttemptToUnresponsiveTls) {
+            EXPECT_GT(unresponsiveTls.acceptConnectionsCount(), 0);
+        } else {
+            EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 0);
+        }
 
         TlsNameLastTime = config.tlsName;
+        unresponsiveTls.clearConnectionsCount();
     }
 
     // Check that all the validation results are caught.
@@ -5781,17 +5803,17 @@ TEST_F(ResolverTest, RepeatedSetup_KeepChangingPrivateDnsServers) {
                 // Must be UNRESPONSIVE.
                 // DnsTlsFrontend is the only signal for checking whether or not the resolver starts
                 // another validation when the server is unresponsive.
-                const int expectCountDiff =
-                        config.expectNothingHappenWhenServerUnresponsive ? 0 : 1;
-                if (expectCountDiff == 0) {
-                    // It's possible that the resolver hasn't yet started to
-                    // connect. Wait a while.
-                    std::this_thread::sleep_for(100ms);
-                } else {
+
+                // Wait for a while to avoid running the checker code too early.
+                std::this_thread::sleep_for(200ms);
+                if (!config.expectNothingHappenWhenServerUnresponsive) {
                     EXPECT_TRUE(WaitForPrivateDnsValidation(config.tlsServer, false));
                 }
                 const auto condition = [&]() {
-                    return tls.acceptConnectionsCount() == connectCountsBefore + expectCountDiff;
+                    const int connectCountsAfter = tls.acceptConnectionsCount();
+                    return config.expectNothingHappenWhenServerUnresponsive
+                                   ? (connectCountsAfter == connectCountsBefore)
+                                   : (connectCountsAfter > connectCountsBefore);
                 };
                 EXPECT_TRUE(PollForCondition(condition));
             }
