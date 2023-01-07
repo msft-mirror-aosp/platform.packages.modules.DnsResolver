@@ -75,6 +75,14 @@
 #include "tests/tun_forwarder.h"
 #include "tests/unsolicited_listener/unsolicited_event_listener.h"
 
+// This mainline module test still needs to be able to run on pre-S devices,
+// and thus may run across pre-4.9 non-eBPF capable devices like the Pixel 2.
+#define SKIP_IF_BPF_NOT_SUPPORTED                           \
+    do {                                                    \
+        if (!android::bpf::isAtLeastKernelVersion(4, 9, 0)) \
+            GTEST_SKIP() << "Skip: bpf is not supported.";  \
+    } while (0)
+
 // Valid VPN netId range is 100 ~ 65535
 constexpr int TEST_VPN_NETID = 65502;
 constexpr int MAXPACKET = (8 * 1024);
@@ -1641,6 +1649,67 @@ TEST_F(ResolverTest, GetAddrInfoFromCustTable_Modify) {
     ASSERT_TRUE(result != nullptr);
     EXPECT_THAT(ToStrings(result), testing::UnorderedElementsAreArray({dnsSvAddrV4, dnsSvAddrV6}));
     EXPECT_EQ(2U, GetNumQueries(dns, hostnameV4V6));
+}
+
+TEST_F(ResolverTest, GetAddrInfoV4V6FromCustTable_MultiAnswers) {
+    test::DNSResponder dns;
+    StartDns(dns, {});
+
+    auto resolverParams = DnsResponderClient::GetDefaultResolverParamsParcel();
+    ResolverOptionsParcel resolverOptions;
+    resolverOptions.hosts = {
+            {kHelloExampleComAddrV4, kHelloExampleCom},
+            {kHelloExampleComAddrV6_GUA, kHelloExampleCom},
+            {kHelloExampleComAddrV6_IPV4COMPAT, kHelloExampleCom},
+            {kHelloExampleComAddrV6_TEREDO, kHelloExampleCom},
+    };
+    if (!mIsResolverOptionIPCSupported) {
+        resolverParams.resolverOptions = resolverOptions;
+    }
+    ASSERT_TRUE(mDnsClient.resolvService()->setResolverConfiguration(resolverParams).isOk());
+
+    if (mIsResolverOptionIPCSupported) {
+        ASSERT_TRUE(mDnsClient.resolvService()
+                            ->setResolverOptions(resolverParams.netId, resolverOptions)
+                            .isOk());
+    }
+
+    addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
+    ScopedAddrinfo result = safe_getaddrinfo(kHelloExampleCom, nullptr, &hints);
+    ASSERT_TRUE(result != nullptr);
+    // Expect the order is the same as the order of record insertion because the custom table uses
+    // std::multimap to store and the queried results are not sorted by RFC 6724.
+    // See getCustomHosts in packages/modules/DnsResolver/getaddrinfo.cpp
+    EXPECT_THAT(ToStrings(result),
+                testing::ElementsAreArray({kHelloExampleComAddrV4, kHelloExampleComAddrV6_GUA,
+                                           kHelloExampleComAddrV6_IPV4COMPAT,
+                                           kHelloExampleComAddrV6_TEREDO}));
+    EXPECT_EQ(0U, GetNumQueries(dns, kHelloExampleCom));
+
+    hints = {.ai_family = AF_UNSPEC};
+    result = safe_getaddrinfo(kHelloExampleCom, nullptr, &hints);
+    ASSERT_TRUE(result != nullptr);
+    // The overall result is the concatenation of each result from explore_fqdn().
+    // resolv_getaddrinfo() calls explore_fqdn() many times by the different explore_options.
+    // It means that the results of each explore_options keep the order and concatenates
+    // all results into one link list. The address order of the output addrinfo is:
+    //   1.2.3.4 (socktype=2, protocol=17) ->
+    //   2404:6800::5175:15ca (socktype=2, protocol=17) ->
+    //   ::1.2.3.4 (socktype=2, protocol=17) ->
+    //   2001::47c1 (socktype=2, protocol=17) ->
+    //   1.2.3.4 (socktype=1, protocol=6) ->
+    //   2404:6800::5175:15ca (socktype=1, protocol=6) ->
+    //   ::1.2.3.4 (socktype=1, protocol=6) ->
+    //   2001::47c1 (socktype=1, protocol=6)
+    //
+    // See resolv_getaddrinfo, explore_fqdn and dns_getaddrinfo.
+    EXPECT_THAT(ToStrings(result),
+                testing::ElementsAreArray(
+                        {kHelloExampleComAddrV4, kHelloExampleComAddrV6_GUA,
+                         kHelloExampleComAddrV6_IPV4COMPAT, kHelloExampleComAddrV6_TEREDO,
+                         kHelloExampleComAddrV4, kHelloExampleComAddrV6_GUA,
+                         kHelloExampleComAddrV6_IPV4COMPAT, kHelloExampleComAddrV6_TEREDO}));
+    EXPECT_EQ(0U, GetNumQueries(dns, kHelloExampleCom));
 }
 
 TEST_F(ResolverTest, EmptySetup) {
@@ -4891,8 +4960,16 @@ TEST_F(ResolverTest, SkipUnusableTlsServer) {
             expectAnswersValid(fd, AF_INET6, kHelloExampleComAddrV6);
         }
 
-        EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1);
-        EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2);
+        if (GetProperty(kDotAsyncHandshakeFlag, "0") == "0") {
+            EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1);
+            EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2);
+        } else {
+            // If the flag dot_async_handshake is set to 1, the DnsResolver will try
+            // DoT connection establishment at most |retries| times.
+            const int retries = std::stoi(GetProperty(kDotMaxretriesFlag, "3"));
+            EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1 * retries);
+            EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2 * retries);
+        }
     }
 }
 
@@ -5531,7 +5608,6 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
     StartDns(dns2, {});
     test::DnsTlsFrontend workableTls(addr1, "853", addr1, "53");
     test::DnsTlsFrontend unresponsiveTls(addr2, "853", addr2, "53");
-    int validationAttemptsToUnresponsiveTls = 1;
     unresponsiveTls.setHangOnHandshakeForTesting(true);
     ASSERT_TRUE(workableTls.startServer());
     ASSERT_TRUE(unresponsiveTls.startServer());
@@ -5547,7 +5623,8 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
     EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
 
     // The validation is still in progress.
-    EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), validationAttemptsToUnresponsiveTls);
+    EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 1);
+    unresponsiveTls.clearConnectionsCount();
 
     static const struct TestConfig {
         std::vector<std::string> tlsServers;
@@ -5569,6 +5646,7 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
         parcel.caCertificate = config.tlsName.empty() ? "" : kCaCert;
 
         const bool dnsModeChanged = (TlsNameLastTime != config.tlsName);
+        bool validationAttemptToUnresponsiveTls = false;
 
         waitForPrivateDnsStateUpdated();
         ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
@@ -5587,7 +5665,7 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
                     // Despite the identical IP address, the server is regarded as a different
                     // server when DnsTlsServer.name is different. The resolver treats it as a
                     // different object and begins the validation process.
-                    validationAttemptsToUnresponsiveTls++;
+                    validationAttemptToUnresponsiveTls = true;
 
                     // This is the limitation from DnsTlsFrontend. DnsTlsFrontend can't operate
                     // concurrently. As soon as there's another connection request,
@@ -5620,9 +5698,14 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
             EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
         }
 
-        EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), validationAttemptsToUnresponsiveTls);
+        if (validationAttemptToUnresponsiveTls) {
+            EXPECT_GT(unresponsiveTls.acceptConnectionsCount(), 0);
+        } else {
+            EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 0);
+        }
 
         TlsNameLastTime = config.tlsName;
+        unresponsiveTls.clearConnectionsCount();
     }
 
     // Check that all the validation results are caught.
@@ -5720,17 +5803,17 @@ TEST_F(ResolverTest, RepeatedSetup_KeepChangingPrivateDnsServers) {
                 // Must be UNRESPONSIVE.
                 // DnsTlsFrontend is the only signal for checking whether or not the resolver starts
                 // another validation when the server is unresponsive.
-                const int expectCountDiff =
-                        config.expectNothingHappenWhenServerUnresponsive ? 0 : 1;
-                if (expectCountDiff == 0) {
-                    // It's possible that the resolver hasn't yet started to
-                    // connect. Wait a while.
-                    std::this_thread::sleep_for(100ms);
-                } else {
+
+                // Wait for a while to avoid running the checker code too early.
+                std::this_thread::sleep_for(200ms);
+                if (!config.expectNothingHappenWhenServerUnresponsive) {
                     EXPECT_TRUE(WaitForPrivateDnsValidation(config.tlsServer, false));
                 }
                 const auto condition = [&]() {
-                    return tls.acceptConnectionsCount() == connectCountsBefore + expectCountDiff;
+                    const int connectCountsAfter = tls.acceptConnectionsCount();
+                    return config.expectNothingHappenWhenServerUnresponsive
+                                   ? (connectCountsAfter == connectCountsBefore)
+                                   : (connectCountsAfter > connectCountsBefore);
                 };
                 EXPECT_TRUE(PollForCondition(condition));
             }
@@ -7669,6 +7752,10 @@ TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRoute) {
 // Test if the "do not send AAAA query when IPv6 address is link-local with a default route" feature
 // can be toggled by flag.
 TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRouteFlag) {
+    // Kernel 4.4 does not provide an IPv6 link-local address when an interface is added to a
+    // network. Skip it because v6 link-local address is a prerequisite for this test.
+    SKIP_IF_KERNEL_VERSION_LOWER_THAN(4, 9, 0);
+
     constexpr char host_name[] = "ohayou.example.com.";
     const struct TestConfig {
         std::string flagValue;
