@@ -102,6 +102,7 @@ cc_test {
     ],
     shared_libs: [
         "libbinder_ndk",
+        "libstatssocket",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
@@ -219,6 +220,12 @@ cc_test {
             suffix: "64",
         },
     },
+    // 'resolv_integration_test' used DisableConfigSyncTargetPreparer provided
+    // by net-tests-utils-host-common; adding it to make the host jar available
+    // after the build process.
+    host_required: [
+        "net-tests-utils-host-common",
+    ]
 }
 
 cc_test {
@@ -245,6 +252,7 @@ cc_test {
     ],
     shared_libs: [
         "libbinder_ndk",
+        "libstatssocket",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
@@ -326,9 +334,11 @@ cc_test {
         "libgmock",
         "libnetdutils",
         "libssl",
+        "stats_proto",
     ],
     shared_libs: [
         "libnetd_client",
+        "libstatssocket",
     ],
 }
 
@@ -348,6 +358,7 @@ cc_defaults {
     ],
     shared_libs: [
         "libbinder_ndk",
+        "libstatssocket",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
