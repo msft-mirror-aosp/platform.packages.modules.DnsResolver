@@ -78,20 +78,14 @@ class DoHFFITest : public NetNativeTestBase {
 
 TEST_F(DoHFFITest, SmokeTest) {
     getNetworkForDns(&dnsNetId);
-    if (dnsNetId < MINIMAL_NET_ID) {
-        GTEST_SKIP() << "No available networks";
-    }
-
+    ASSERT_GE(dnsNetId, MINIMAL_NET_ID) << "No available networks";
     LOG(INFO) << "dnsNetId: " << dnsNetId;
 
     const bool have_ipv4 = haveIpv4();
     const bool have_ipv6 = haveIpv6();
-    if (!have_ipv4 && !have_ipv6) {
-        GTEST_SKIP() << "No connectivity on network " << dnsNetId;
-    }
+    ASSERT_TRUE(have_ipv4 | have_ipv6) << "No connectivity on network " << dnsNetId;
 
     const static char* server_ip = have_ipv6 ? GOOGLE_SERVER_IPV6 : GOOGLE_SERVER_IP;
-
     auto validation_cb = [](uint32_t netId, bool success, const char* ip_addr, const char* host) {
         EXPECT_EQ(netId, dnsNetId);
         EXPECT_TRUE(success);
@@ -115,7 +109,9 @@ TEST_F(DoHFFITest, SmokeTest) {
     // sk_mark doesn't matter here because this test doesn't have permission to set sk_mark.
     // The DNS packet would be sent via default network.
     EXPECT_EQ(doh_net_new(doh, dnsNetId, "https://dns.google/dns-query", /* domain */ "", server_ip,
-                          /* sk_mark */ 0, /* cert_path */ "", &flags),
+                          /* sk_mark */ 0, /* cert_path */ "", &flags,
+                          /* NetworkType::NT_WIFI */ 3,
+                          /* PrivateDnsMode::STRICT */ 2),
               0);
     {
         std::unique_lock<std::mutex> lk(m);

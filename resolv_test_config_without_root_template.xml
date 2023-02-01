@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Copyright (C) 2020 The Android Open Source Project
+<!-- Copyright (C) 2022 The Android Open Source Project
 
      Licensed under the Apache License, Version 2.0 (the "License");
      you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@
 <configuration description="Configuration for {MODULE} tests">
    <option name="test-suite-tag" value="mts" />
    <option name="config-descriptor:metadata" key="mainline-param" value="CaptivePortalLoginGoogle.apk+NetworkStackGoogle.apk+com.google.android.resolv.apex+com.google.android.tethering.apex" />
-   <target_preparer class="com.android.tradefed.targetprep.RootTargetPreparer"/>
    <target_preparer class="com.android.testutils.DisableConfigSyncTargetPreparer" />
    <target_preparer class="com.android.compatibility.common.tradefed.targetprep.FilePusher">
        <option name="cleanup" value="true" />

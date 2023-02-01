@@ -59,6 +59,7 @@
 #include "resolv_private.h"
 #include "stats.h"  // RCODE_TIMEOUT
 #include "stats.pb.h"
+#include "util.h"
 
 using aidl::android::net::metrics::INetdEventListener;
 using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
@@ -263,17 +264,9 @@ bool parseQuery(span<const uint8_t> msg, uint16_t* query_id, int* rr_type, std::
 // Note: Even if it returns PDM_OFF, it doesn't mean there's no DoT stats in the message
 // because Private DNS mode can change at any time.
 PrivateDnsModes getPrivateDnsModeForMetrics(uint32_t netId) {
-    switch (PrivateDnsConfiguration::getInstance().getStatus(netId).mode) {
-        case PrivateDnsMode::OFF:
-            // It can also be due to netId not found.
-            return PrivateDnsModes::PDM_OFF;
-        case PrivateDnsMode::OPPORTUNISTIC:
-            return PrivateDnsModes::PDM_OPPORTUNISTIC;
-        case PrivateDnsMode::STRICT:
-            return PrivateDnsModes::PDM_STRICT;
-        default:
-            return PrivateDnsModes::PDM_UNKNOWN;
-    }
+    // If the network `netId` doesn't exist, getStatus() sets the mode to PrivateDnsMode::OFF and
+    // returns it. This is incorrect for the metrics. Consider returning PDM_UNKNOWN in such case.
+    return convertEnumType(PrivateDnsConfiguration::getInstance().getStatus(netId).mode);
 }
 
 void initDnsEvent(NetworkDnsEventReported* event, const android_net_context& netContext) {
@@ -681,11 +674,14 @@ DnsProxyListener::GetAddrInfoHandler::GetAddrInfoHandler(SocketClient* c, std::s
                                                          std::unique_ptr<addrinfo> hints,
                                                          const android_net_context& netcontext)
     : Handler(c),
-      mHost(move(host)),
-      mService(move(service)),
-      mHints(move(hints)),
+      mHost(std::move(host)),
+      mService(std::move(service)),
+      mHints(std::move(hints)),
       mNetContext(netcontext) {}
 
+// Before U, the Netd callback is implemented by OEM to evaluate if a DNS query for the provided
+// hostname is allowed. On U+, the Netd callback also checks if the user is allowed to send DNS on
+// the specified network.
 static bool evaluate_domain_name(const android_net_context& netcontext, const char* host) {
     if (!gResNetdCallbacks.evaluate_domain_name) return true;
     return gResNetdCallbacks.evaluate_domain_name(netcontext, host);
@@ -824,9 +820,7 @@ void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinf
 }
 
 void DnsProxyListener::GetAddrInfoHandler::run() {
-    LOG(INFO) << "GetAddrInfoHandler::run: {" << mNetContext.app_netid << " "
-              << mNetContext.app_mark << " " << mNetContext.dns_netid << " " << mNetContext.dns_mark
-              << " " << mNetContext.uid << " " << mNetContext.flags << "}";
+    LOG(INFO) << "GetAddrInfoHandler::run: {" << mNetContext.toString() << "}";
 
     addrinfo* result = nullptr;
     Stopwatch s;
@@ -954,7 +948,7 @@ int DnsProxyListener::GetAddrInfoCmd::runCommand(SocketClient* cli, int argc, ch
         hints->ai_protocol = ai_protocol;
     }
 
-    (new GetAddrInfoHandler(cli, name, service, move(hints), netcontext))->spawn();
+    (new GetAddrInfoHandler(cli, name, service, std::move(hints), netcontext))->spawn();
     return 0;
 }
 
@@ -1008,9 +1002,7 @@ DnsProxyListener::ResNSendHandler::ResNSendHandler(SocketClient* c, std::string 
     : Handler(c), mMsg(std::move(msg)), mFlags(flags), mNetContext(netcontext) {}
 
 void DnsProxyListener::ResNSendHandler::run() {
-    LOG(INFO) << "ResNSendHandler::run: " << mFlags << " / {" << mNetContext.app_netid << " "
-              << mNetContext.app_mark << " " << mNetContext.dns_netid << " " << mNetContext.dns_mark
-              << " " << mNetContext.uid << " " << mNetContext.flags << "}";
+    LOG(INFO) << "ResNSendHandler::run: " << mFlags << " / {" << mNetContext.toString() << "}";
 
     Stopwatch s;
     maybeFixupNetContext(&mNetContext, mClient->getPid());
@@ -1202,7 +1194,7 @@ int DnsProxyListener::GetHostByNameCmd::runCommand(SocketClient* cli, int argc, 
 DnsProxyListener::GetHostByNameHandler::GetHostByNameHandler(SocketClient* c, std::string name,
                                                              int af,
                                                              const android_net_context& netcontext)
-    : Handler(c), mName(move(name)), mAf(af), mNetContext(netcontext) {}
+    : Handler(c), mName(std::move(name)), mAf(af), mNetContext(netcontext) {}
 
 void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hostent* hbuf, char* buf,
                                                               size_t buflen, struct hostent** hpp,
@@ -1243,6 +1235,7 @@ void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hoste
 }
 
 void DnsProxyListener::GetHostByNameHandler::run() {
+    LOG(INFO) << "GetHostByNameHandler::run: {" << mNetContext.toString() << "}";
     Stopwatch s;
     maybeFixupNetContext(&mNetContext, mClient->getPid());
     const uid_t uid = mClient->getUid();
@@ -1404,6 +1397,7 @@ void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(hostent* hbuf,
 }
 
 void DnsProxyListener::GetHostByAddrHandler::run() {
+    LOG(INFO) << "GetHostByAddrHandler::run: {" << mNetContext.toString() << "}";
     Stopwatch s;
     maybeFixupNetContext(&mNetContext, mClient->getPid());
     const uid_t uid = mClient->getUid();
@@ -1414,8 +1408,18 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
     if (queryLimiter.start(uid)) {
-        rv = resolv_gethostbyaddr(&mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
-                                  sizeof tmpbuf, &mNetContext, &hp, &event);
+        // From Android U, evaluate_domain_name() is not only for OEM customization, but also tells
+        // DNS resolver whether the UID can send DNS on the specified network. The function needs
+        // to be called even when there is no domain name to evaluate (GetHostByAddr). This is
+        // applied on U+ only so that the behavior won’t change on T- OEM devices.
+        // TODO: pass the actual name into evaluate_domain_name, e.g., 238.26.217.172.in-addr.arpa
+        //       when the lookup address is 172.217.26.238.
+        if (isAtLeastU() && !evaluate_domain_name(mNetContext, nullptr)) {
+            rv = EAI_SYSTEM;
+        } else {
+            rv = resolv_gethostbyaddr(&mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
+                                      sizeof tmpbuf, &mNetContext, &hp, &event);
+        }
         queryLimiter.finish(uid);
     } else {
         rv = EAI_MEMORY;
