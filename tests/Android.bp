@@ -219,6 +219,12 @@ cc_test {
             suffix: "64",
         },
     },
+    // 'resolv_integration_test' used DisableConfigSyncTargetPreparer provided
+    // by net-tests-utils-host-common; adding it to make the host jar available
+    // after the build process.
+    host_required: [
+        "net-tests-utils-host-common",
+    ]
 }
 
 cc_test {
@@ -391,4 +397,46 @@ cc_fuzz {
     name: "resolv_getaddrinfo_fuzzer",
     defaults: ["resolv_fuzzer_defaults"],
     srcs: ["fuzzer/resolv_getaddrinfo_fuzzer.cpp"],
+}
+
+cc_fuzz {
+    name: "resolv_service_fuzzer",
+    defaults: [
+        "resolv_fuzzer_defaults",
+    ],
+    static_libs: [
+        "libstatslog_resolv",
+        "libstatspush_compat",
+        "libbase",
+        "libbinder_random_parcel",
+        "libcutils",
+    ],
+    target: {
+        android: {
+            shared_libs: [
+                "libbinder_ndk",
+                "libbinder",
+                "libutils",
+            ],
+        },
+        host: {
+            static_libs: [
+                "libbinder_ndk",
+                "libbinder",
+                "libutils",
+            ],
+        },
+        darwin: {
+            enabled: false,
+        },
+    },
+    fuzz_config: {
+        cc: [
+            "smoreland@google.com",
+            "waghpawan@google.com",
+        ],
+        // Adds bugs to hotlist "AIDL fuzzer bugs" on buganizer
+        hotlists: ["4637097"],
+    },
+    srcs: ["fuzzer/resolv_service_fuzzer.cpp"],
 }

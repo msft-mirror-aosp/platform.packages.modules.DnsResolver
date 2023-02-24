@@ -75,6 +75,14 @@
 #include "tests/tun_forwarder.h"
 #include "tests/unsolicited_listener/unsolicited_event_listener.h"
 
+// This mainline module test still needs to be able to run on pre-S devices,
+// and thus may run across pre-4.9 non-eBPF capable devices like the Pixel 2.
+#define SKIP_IF_BPF_NOT_SUPPORTED                           \
+    do {                                                    \
+        if (!android::bpf::isAtLeastKernelVersion(4, 9, 0)) \
+            GTEST_SKIP() << "Skip: bpf is not supported.";  \
+    } while (0)
+
 // Valid VPN netId range is 100 ~ 65535
 constexpr int TEST_VPN_NETID = 65502;
 constexpr int MAXPACKET = (8 * 1024);
@@ -95,7 +103,9 @@ using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
 using aidl::android::net::ResolverOptionsParcel;
 using aidl::android::net::ResolverParamsParcel;
+using aidl::android::net::UidRangeParcel;
 using aidl::android::net::metrics::INetdEventListener;
+using aidl::android::net::netd::aidl::NativeUidRangeConfig;
 using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
 using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
 using aidl::android::net::resolv::aidl::Nat64PrefixEventParcel;
@@ -4952,8 +4962,16 @@ TEST_F(ResolverTest, SkipUnusableTlsServer) {
             expectAnswersValid(fd, AF_INET6, kHelloExampleComAddrV6);
         }
 
-        EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1);
-        EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2);
+        if (GetProperty(kDotAsyncHandshakeFlag, "0") == "0") {
+            EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1);
+            EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2);
+        } else {
+            // If the flag dot_async_handshake is set to 1, the DnsResolver will try
+            // DoT connection establishment at most |retries| times.
+            const int retries = std::stoi(GetProperty(kDotMaxretriesFlag, "3"));
+            EXPECT_EQ(dot1.acceptConnectionsCount(), config.expectedQueriesSentToDot1 * retries);
+            EXPECT_EQ(dot2.acceptConnectionsCount(), config.expectedQueriesSentToDot2 * retries);
+        }
     }
 }
 
@@ -5592,7 +5610,6 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
     StartDns(dns2, {});
     test::DnsTlsFrontend workableTls(addr1, "853", addr1, "53");
     test::DnsTlsFrontend unresponsiveTls(addr2, "853", addr2, "53");
-    int validationAttemptsToUnresponsiveTls = 1;
     unresponsiveTls.setHangOnHandshakeForTesting(true);
     ASSERT_TRUE(workableTls.startServer());
     ASSERT_TRUE(unresponsiveTls.startServer());
@@ -5608,7 +5625,8 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
     EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
 
     // The validation is still in progress.
-    EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), validationAttemptsToUnresponsiveTls);
+    EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 1);
+    unresponsiveTls.clearConnectionsCount();
 
     static const struct TestConfig {
         std::vector<std::string> tlsServers;
@@ -5630,6 +5648,7 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
         parcel.caCertificate = config.tlsName.empty() ? "" : kCaCert;
 
         const bool dnsModeChanged = (TlsNameLastTime != config.tlsName);
+        bool validationAttemptToUnresponsiveTls = false;
 
         waitForPrivateDnsStateUpdated();
         ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
@@ -5648,7 +5667,7 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
                     // Despite the identical IP address, the server is regarded as a different
                     // server when DnsTlsServer.name is different. The resolver treats it as a
                     // different object and begins the validation process.
-                    validationAttemptsToUnresponsiveTls++;
+                    validationAttemptToUnresponsiveTls = true;
 
                     // This is the limitation from DnsTlsFrontend. DnsTlsFrontend can't operate
                     // concurrently. As soon as there's another connection request,
@@ -5681,9 +5700,14 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
             EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
         }
 
-        EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), validationAttemptsToUnresponsiveTls);
+        if (validationAttemptToUnresponsiveTls) {
+            EXPECT_GT(unresponsiveTls.acceptConnectionsCount(), 0);
+        } else {
+            EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 0);
+        }
 
         TlsNameLastTime = config.tlsName;
+        unresponsiveTls.clearConnectionsCount();
     }
 
     // Check that all the validation results are caught.
@@ -5781,17 +5805,17 @@ TEST_F(ResolverTest, RepeatedSetup_KeepChangingPrivateDnsServers) {
                 // Must be UNRESPONSIVE.
                 // DnsTlsFrontend is the only signal for checking whether or not the resolver starts
                 // another validation when the server is unresponsive.
-                const int expectCountDiff =
-                        config.expectNothingHappenWhenServerUnresponsive ? 0 : 1;
-                if (expectCountDiff == 0) {
-                    // It's possible that the resolver hasn't yet started to
-                    // connect. Wait a while.
-                    std::this_thread::sleep_for(100ms);
-                } else {
+
+                // Wait for a while to avoid running the checker code too early.
+                std::this_thread::sleep_for(200ms);
+                if (!config.expectNothingHappenWhenServerUnresponsive) {
                     EXPECT_TRUE(WaitForPrivateDnsValidation(config.tlsServer, false));
                 }
                 const auto condition = [&]() {
-                    return tls.acceptConnectionsCount() == connectCountsBefore + expectCountDiff;
+                    const int connectCountsAfter = tls.acceptConnectionsCount();
+                    return config.expectNothingHappenWhenServerUnresponsive
+                                   ? (connectCountsAfter == connectCountsBefore)
+                                   : (connectCountsAfter > connectCountsBefore);
                 };
                 EXPECT_TRUE(PollForCondition(condition));
             }
@@ -7012,6 +7036,20 @@ class ResolverMultinetworkTest : public ResolverTest {
             }
             return {};
         }
+
+        Result<void> addUserFromParcel(uid_t uid, int32_t subPriority) const {
+            return addUidRangeFromParcel(uid, uid, subPriority);
+        }
+
+        Result<void> addUidRangeFromParcel(uid_t from, uid_t to, int32_t subPriority) const {
+            NativeUidRangeConfig cfg =
+                    makeNativeUidRangeConfig(mNetId, {makeUidRangeParcel(from, to)}, subPriority);
+            if (auto r = mNetdSrv->networkAddUidRangesParcel(cfg); !r.isOk()) {
+                return Error() << r.getMessage();
+            }
+            return {};
+        }
+
         const std::string& ifname() { return mIfname; }
         // Assuming mNetId is unique during ResolverMultinetworkTest, make the
         // address based on it to avoid conflicts.
@@ -7180,6 +7218,17 @@ class ResolverMultinetworkTest : public ResolverTest {
         dnsServer->clearQueries();
     }
 
+    static NativeUidRangeConfig makeNativeUidRangeConfig(unsigned netId,
+                                                         std::vector<UidRangeParcel> uidRanges,
+                                                         int32_t subPriority) {
+        NativeUidRangeConfig res;
+        res.netId = netId;
+        res.uidRanges = std::move(uidRanges);
+        res.subPriority = subPriority;
+
+        return res;
+    }
+
   private:
     // Use a different netId because this class inherits from the class ResolverTest which
     // always creates TEST_NETID in setup. It's incremented when CreateScoped{Physical,
@@ -7332,6 +7381,11 @@ void expectDnsWorksForUid(const char* name, unsigned netId, uid_t uid,
     ScopedAddrinfo ai_result(std::move(result.value()));
     std::vector<std::string> result_strs = ToStrings(ai_result);
     EXPECT_THAT(result_strs, testing::UnorderedElementsAreArray(expectedResult));
+}
+
+void expectDnsFailedForUid(const char* name, unsigned netId, uid_t uid) {
+    ScopedChangeUID scopedChangeUID(uid);
+    ASSERT_FALSE(android_getaddrinfofornet_wrapper(name, netId).ok());
 }
 
 }  // namespace
@@ -7847,5 +7901,140 @@ TEST_F(ResolverTest, NegativeValueInExperimentFlag) {
         ASSERT_RESULT_OK(resolvInfo);
         EXPECT_EQ(config.expectedRetryCount, resolvInfo.value().params.retry_count);
         EXPECT_EQ(config.expectedBaseTimeoutMsec, resolvInfo.value().params.base_timeout_msec);
+    }
+}
+
+// Verify that DNS queries can be made for hostnames that exist in etc/hosts when the default
+// network is not set and the application does not specify a network. (See
+// NetworkController::isUidAllowed for implementation details.)
+TEST_F(ResolverTest, NetworkUnspecified_localhost) {
+    ScopedDefaultNetwork scopedDefaultNetwork(mDnsClient.netdService(), NETID_UNSET);
+    ScopedSetNetworkForProcess scopedSetNetworkForProcess(NETID_UNSET);
+
+    ScopedAddrinfo result = safe_getaddrinfo(kLocalHost, nullptr, nullptr);
+    EXPECT_TRUE(result != nullptr);
+    EXPECT_EQ(kLocalHostAddr, ToString(result));
+
+    result = safe_getaddrinfo(kIp6LocalHost, nullptr, nullptr);
+    EXPECT_TRUE(result != nullptr);
+    EXPECT_EQ(kIp6LocalHostAddr, ToString(result));
+}
+
+// Verify uid-based network permission on DNS, which is controlled by INetd::setNetworkAllowlist().
+//
+// Scenario:
+// 1. There are three neworks at the same time:
+//  - system default network
+//  - enterprise network #1
+//  - enterprise network #2
+//
+// 2. Simulate ConnectivityService calling INetd::setNetworkAllowlist so that
+//  - TEST_UID can select only enterprise network #1 and #2. Can not select system default network.
+//  - TEST_UID2 is unrestricted on all networks.
+TEST_F(ResolverMultinetworkTest, UidAllowedNetworks) {
+    // Netd supports it from v13.
+    SKIP_IF_REMOTE_VERSION_LESS_THAN(mDnsClient.netdService(), 13);
+
+    constexpr char host_name[] = "ohayou.example.com.";
+    constexpr char ipv4_addr[] = "192.0.2.0";
+    constexpr char ipv6_addr[] = "2001:db8:cafe:d00d::31";
+
+    const std::pair<ConnectivityType, std::vector<std::string>> testPairs[] = {
+            {ConnectivityType::V4, {ipv4_addr}},
+            {ConnectivityType::V6, {ipv6_addr}},
+            {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
+    };
+    for (const auto& [ipVersion, expectedDnsReply] : testPairs) {
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", ipVersion));
+
+        // Create networks.
+        ScopedPhysicalNetwork sysDefaultNetwork =
+                CreateScopedPhysicalNetwork(ipVersion, "SysDefault");
+        ScopedPhysicalNetwork enterpriseNetwork_1 =
+                CreateScopedPhysicalNetwork(ipVersion, "enterprise_1");
+        ScopedPhysicalNetwork enterpriseNetwork_2 =
+                CreateScopedPhysicalNetwork(ipVersion, "enterprise_2");
+        ASSERT_RESULT_OK(sysDefaultNetwork.init());
+        ASSERT_RESULT_OK(enterpriseNetwork_1.init());
+        ASSERT_RESULT_OK(enterpriseNetwork_2.init());
+
+        // Set up resolver and start forwarding for networks.
+        auto sysDefaultNwDnsSv =
+                setupDns(ipVersion, &sysDefaultNetwork, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(sysDefaultNwDnsSv);
+        auto enterpriseNw1DnsSv =
+                setupDns(ipVersion, &enterpriseNetwork_1, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(enterpriseNw1DnsSv);
+        auto enterpriseNw2DnsSv =
+                setupDns(ipVersion, &enterpriseNetwork_2, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(enterpriseNw2DnsSv);
+
+        const unsigned systemDefaultNetId = sysDefaultNetwork.netId();
+        const unsigned enterprise1NetId = enterpriseNetwork_1.netId();
+        const unsigned enterprise2NetId = enterpriseNetwork_2.netId();
+
+        setDefaultNetwork(systemDefaultNetId);
+
+        // We've called setNetworkForProcess in SetupOemNetwork, reset to default first.
+        ScopedSetNetworkForProcess scopedSetNetworkForProcess(NETID_UNSET);
+
+        // Add profile app default network for UID. DNS should be sent on it.
+        // Note: subPriority 20 = PREFERENCE_ORDER_PROFILE, which is defined
+        // in ConnectivityService.java. The value here doesn't really matter.
+        ASSERT_RESULT_OK(enterpriseNetwork_1.addUserFromParcel(TEST_UID, /*subPriority*/ 20));
+        expectDnsWorksForUid(host_name, NETID_UNSET, TEST_UID, expectedDnsReply);
+        expectDnsQueryCountsFn(*enterpriseNw1DnsSv, host_name, expectedDnsReply.size(),
+                               enterprise1NetId);
+
+        // Set allowed networks for UIDs. To simplify test, assumes overall UID range is
+        // {0, 1, 2, ..., TEST_UID2, TEST_UID}.
+        // TEST_UID can't select the system default network. 0 - TEST_UID2 are allowed.
+        NativeUidRangeConfig nwDefaultUserConfig = makeNativeUidRangeConfig(
+                systemDefaultNetId, {makeUidRangeParcel(0, TEST_UID2)}, /*unused*/ 0);
+        // All UIDs can select the enterprise network #1. 0 - TEST_UID are allowed.
+        NativeUidRangeConfig nw1UserConfig = makeNativeUidRangeConfig(
+                enterprise1NetId, {makeUidRangeParcel(0, TEST_UID)}, /*unused*/ 0);
+        // All UIDs can select the enterprise network #2. 0 - TEST_UID are allowed.
+        NativeUidRangeConfig nw2UserConfig = makeNativeUidRangeConfig(
+                enterprise2NetId, {makeUidRangeParcel(0, TEST_UID)}, /*unused*/ 0);
+        EXPECT_TRUE(
+                mDnsClient.netdService()
+                        ->setNetworkAllowlist({nwDefaultUserConfig, nw1UserConfig, nw2UserConfig})
+                        .isOk());
+
+        // Verify that DNS is behaving as the setting.
+        struct TestConfig {
+            int uid;
+            const ScopedNetwork& selectedNetwork;
+            bool expectedSuccess;
+        } configs[]{
+                // clang-format off
+                {TEST_UID, sysDefaultNetwork, false},
+                {TEST_UID, enterpriseNetwork_1, true},
+                {TEST_UID, enterpriseNetwork_2, true},
+                {TEST_UID2, sysDefaultNetwork, true},
+                {TEST_UID2, enterpriseNetwork_1, true},
+                {TEST_UID2, enterpriseNetwork_2, true},
+                // clang-format on
+        };
+        for (const auto& cfg : configs) {
+            SCOPED_TRACE(fmt::format("Dns over UID {}, selectedNetwork {}", cfg.uid,
+                                     cfg.selectedNetwork.name()));
+            if (cfg.expectedSuccess) {
+                expectDnsWorksForUid(host_name, cfg.selectedNetwork.netId(), cfg.uid,
+                                     expectedDnsReply);
+            } else {
+                expectDnsFailedForUid(host_name, cfg.selectedNetwork.netId(), cfg.uid);
+            }
+        }
+
+        // Clear network restrictions.
+        EXPECT_TRUE(mDnsClient.netdService()->setNetworkAllowlist({}).isOk());
+        // TEST_UID and TEST_UID2 can both select all networks.
+        for (const auto& cfg : configs) {
+            SCOPED_TRACE(fmt::format("Dns over UID {}, selectedNetwork {}", cfg.uid,
+                                     cfg.selectedNetwork.name()));
+            expectDnsWorksForUid(host_name, cfg.selectedNetwork.netId(), cfg.uid, expectedDnsReply);
+        }
     }
 }
