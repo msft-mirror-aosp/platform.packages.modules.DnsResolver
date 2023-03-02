@@ -107,6 +107,7 @@ aidl_interface {
         "8",
         "9",
         "10",
+        "11",
     ],
     dumpapi: {
         no_license: true,
@@ -148,6 +149,34 @@ cc_defaults {
             suffix: "64",
         },
     },
+    // 'resolv_test_config_template' used DisableConfigSyncTargetPreparer provided
+    // by net-tests-utils-host-common; adding it to make the host jar available
+    // after the build process.
+    host_required: [
+        "net-tests-utils-host-common",
+    ]
+}
+
+cc_defaults {
+    // Similar to resolv_test_mts_coverage_defaults, but it's for the tests that don't need
+    // root access.
+    name: "resolv_test_mts_coverage_without_root_defaults",
+    test_config_template: ":resolv_test_config_without_root_template",
+    compile_multilib: "both",
+    multilib: {
+        lib32: {
+            suffix: "32",
+        },
+        lib64: {
+            suffix: "64",
+        },
+    },
+    // 'resolv_test_config_without_root_template' used DisableConfigSyncTargetPreparer
+    // provided by net-tests-utils-host-common; adding it to make the host jar available
+    // after the build process.
+    host_required: [
+        "net-tests-utils-host-common",
+    ]
 }
 
 cc_library {
@@ -304,6 +333,13 @@ filegroup {
     name: "resolv_test_config_template",
     srcs: [
         "resolv_test_config_template.xml",
+    ],
+}
+
+filegroup {
+    name: "resolv_test_config_without_root_template",
+    srcs: [
+        "resolv_test_config_without_root_template.xml",
     ],
 }
 
