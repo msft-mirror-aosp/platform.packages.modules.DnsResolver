@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 The Android Open Source Project
+ * Copyright (C) 2023 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,19 @@
  * limitations under the License.
  */
 
-//! DoH backend for the Android DnsResolver module.
+#include <fuzzbinder/libbinder_ndk_driver.h>
+#include <fuzzer/FuzzedDataProvider.h>
 
-pub mod boot_time;
-mod config;
-mod connection;
-mod dispatcher;
-mod encoding;
-mod ffi;
-mod network;
+#include <android/binder_interface_utils.h>
+
+#include "DnsResolverService.h"
+
+using android::fuzzService;
+using android::net::DnsResolverService;
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    auto resolverService = ::ndk::SharedRefBase::make<DnsResolverService>();
+    fuzzService(resolverService->asBinder().get(), FuzzedDataProvider(data, size));
+
+    return 0;
+}
