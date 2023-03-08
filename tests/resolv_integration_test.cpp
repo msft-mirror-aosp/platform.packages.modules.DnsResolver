@@ -103,7 +103,9 @@ using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
 using aidl::android::net::ResolverOptionsParcel;
 using aidl::android::net::ResolverParamsParcel;
+using aidl::android::net::UidRangeParcel;
 using aidl::android::net::metrics::INetdEventListener;
+using aidl::android::net::netd::aidl::NativeUidRangeConfig;
 using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
 using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
 using aidl::android::net::resolv::aidl::Nat64PrefixEventParcel;
@@ -6095,6 +6097,12 @@ TEST_P(ResolverParameterizedTest, TruncatedResponse) {
     EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom));
 }
 
+// Tests that the DnsResolver can keep listening to the DNS response from previous DNS servers.
+// Test scenarios (The timeout for each server is 1 second):
+//   1. (During the first iteration of DNS servers) While waiting for the DNS response from the
+//      second server, the DnsResolver receives the DNS response from the first server.
+//   2. (During the second iteration of DNS servers) While waiting for the DNS response from the
+//      second server, the DnsResolver receives the DNS response from the first server.
 TEST_F(ResolverTest, KeepListeningUDP) {
     constexpr char listen_addr1[] = "127.0.0.4";
     constexpr char listen_addr2[] = "127.0.0.5";
@@ -6102,43 +6110,51 @@ TEST_F(ResolverTest, KeepListeningUDP) {
     const std::vector<DnsRecord> records = {
             {host_name, ns_type::ns_t_aaaa, "::1.2.3.4"},
     };
-    const std::array<int, IDnsResolver::RESOLVER_PARAMS_COUNT> params = {
-            300, 25, 8, 8, 1000 /* BASE_TIMEOUT_MSEC */, 1 /* retry count */};
-    const int delayTimeMs = 1500;
+    auto builder =
+            ResolverParams::Builder().setDnsServers({listen_addr1, listen_addr2}).setDotServers({});
 
     test::DNSResponder neverRespondDns(listen_addr2, "53", static_cast<ns_rcode>(-1));
     neverRespondDns.setResponseProbability(0.0);
     StartDns(neverRespondDns, records);
-    ScopedSystemProperties scopedSystemProperties(
-            "persist.device_config.netd_native.keep_listening_udp", "1");
-    // Re-setup test network to make experiment flag take effect.
-    resetNetwork();
-
-    ASSERT_TRUE(
-            mDnsClient.SetResolversFromParcel(ResolverParams::Builder()
-                                                      .setDnsServers({listen_addr1, listen_addr2})
-                                                      .setDotServers({})
-                                                      .setParams(params)
-                                                      .build()));
-    // There are 2 DNS servers for this test.
-    // |delayedDns| will be blocked for |delayTimeMs|, then start to respond to requests.
-    // |neverRespondDns| will never respond.
-    // In the first try, resolver will send query to |delayedDns| but get timeout error
-    // because |delayTimeMs| > DNS timeout.
-    // Then it's the second try, resolver will send query to |neverRespondDns| and
-    // listen on both servers. Resolver will receive the answer coming from |delayedDns|.
-
     test::DNSResponder delayedDns(listen_addr1);
-    delayedDns.setResponseDelayMs(delayTimeMs);
     StartDns(delayedDns, records);
 
-    // Specify hints to ensure resolver doing query only 1 round.
-    const addrinfo hints = {.ai_family = AF_INET6, .ai_socktype = SOCK_DGRAM};
-    ScopedAddrinfo result = safe_getaddrinfo(host_name, nullptr, &hints);
-    EXPECT_TRUE(result != nullptr);
+    const struct TestConfig {
+        int retryCount;
+        int delayTimeMs;
+    } testConfigs[]{
+            {1, 1500},
+            {2, 3500},
+    };
+    for (const std::string_view callType : {"getaddrinfo", "resnsend"}) {
+        for (const auto& cfg : testConfigs) {
+            SCOPED_TRACE(fmt::format("callType={}, retryCount={}, delayTimeMs={}", callType,
+                                     cfg.retryCount, cfg.delayTimeMs));
+            const std::array<int, IDnsResolver::RESOLVER_PARAMS_COUNT> params = {
+                    300, 25, 8, 8, 1000 /* BASE_TIMEOUT_MSEC */, cfg.retryCount /* retry count */};
 
-    std::string result_str = ToString(result);
-    EXPECT_TRUE(result_str == "::1.2.3.4") << ", result_str='" << result_str << "'";
+            ScopedSystemProperties sp(kKeepListeningUdpFlag, "1");
+            resetNetwork();
+            ASSERT_TRUE(mDnsClient.SetResolversFromParcel(builder.setParams(params).build()));
+
+            delayedDns.setDeferredResp(true);
+            std::thread thread([&]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(cfg.delayTimeMs));
+                delayedDns.setDeferredResp(false);
+            });
+
+            if (callType == "getaddrinfo") {
+                const addrinfo hints = {.ai_family = AF_INET6, .ai_socktype = SOCK_DGRAM};
+                ScopedAddrinfo result = safe_getaddrinfo(host_name, nullptr, &hints);
+                EXPECT_EQ("::1.2.3.4", ToString(result));
+            } else {
+                int fd = resNetworkQuery(TEST_NETID, host_name, ns_c_in, ns_t_aaaa, 0);
+                expectAnswersValid(fd, AF_INET6, "::1.2.3.4");
+            }
+            // TODO(b/271405311): check that the DNS stats from getResolverInfo() is correct.
+            thread.join();
+        }
+    }
 }
 
 TEST_F(ResolverTest, GetAddrInfoParallelLookupTimeout) {
@@ -6154,8 +6170,7 @@ TEST_F(ResolverTest, GetAddrInfoParallelLookupTimeout) {
     test::DNSResponder neverRespondDns(kDefaultServer, "53", static_cast<ns_rcode>(-1));
     neverRespondDns.setResponseProbability(0.0);
     StartDns(neverRespondDns, records);
-    ScopedSystemProperties scopedSystemProperties(
-            "persist.device_config.netd_native.parallel_lookup_release", "1");
+    ScopedSystemProperties sp(kParallelLookupReleaseFlag, "1");
     // The default value of parallel_lookup_sleep_time should be very small
     // that we can ignore in this test case.
     // Re-setup test network to make experiment flag take effect.
@@ -6189,12 +6204,10 @@ TEST_F(ResolverTest, GetAddrInfoParallelLookupSleepTime) {
             300, 25, 8, 8, 1000 /* BASE_TIMEOUT_MSEC */, 1 /* retry count */};
     test::DNSResponder dns(kDefaultServer);
     StartDns(dns, records);
-    ScopedSystemProperties scopedSystemProperties1(
-            "persist.device_config.netd_native.parallel_lookup_release", "1");
+    ScopedSystemProperties sp1(kParallelLookupReleaseFlag, "1");
     constexpr int PARALLEL_LOOKUP_SLEEP_TIME_MS = 500;
-    ScopedSystemProperties scopedSystemProperties2(
-            "persist.device_config.netd_native.parallel_lookup_sleep_time",
-            std::to_string(PARALLEL_LOOKUP_SLEEP_TIME_MS));
+    ScopedSystemProperties sp2(kParallelLookupSleepTimeFlag,
+                               std::to_string(PARALLEL_LOOKUP_SLEEP_TIME_MS));
     // Re-setup test network to make experiment flag take effect.
     resetNetwork();
 
@@ -6411,8 +6424,7 @@ TEST_F(ResolverTest, MdnsGetHostByName) {
     for (int value : keep_listening_udp_enable) {
         if (value == true) {
             // Set keep_listening_udp enable
-            ScopedSystemProperties scopedSystemProperties(
-                    "persist.device_config.netd_native.keep_listening_udp", "1");
+            ScopedSystemProperties sp(kKeepListeningUdpFlag, "1");
             // Re-setup test network to make experiment flag take effect.
             resetNetwork();
         }
@@ -6661,8 +6673,7 @@ TEST_F(ResolverTest, MdnsGetAddrInfo) {
     for (int value : keep_listening_udp_enable) {
         if (value == true) {
             // Set keep_listening_udp enable
-            ScopedSystemProperties scopedSystemProperties(
-                    "persist.device_config.netd_native.keep_listening_udp", "1");
+            ScopedSystemProperties sp(kKeepListeningUdpFlag, "1");
             // Re-setup test network to make experiment flag take effect.
             resetNetwork();
         }
@@ -7034,6 +7045,20 @@ class ResolverMultinetworkTest : public ResolverTest {
             }
             return {};
         }
+
+        Result<void> addUserFromParcel(uid_t uid, int32_t subPriority) const {
+            return addUidRangeFromParcel(uid, uid, subPriority);
+        }
+
+        Result<void> addUidRangeFromParcel(uid_t from, uid_t to, int32_t subPriority) const {
+            NativeUidRangeConfig cfg =
+                    makeNativeUidRangeConfig(mNetId, {makeUidRangeParcel(from, to)}, subPriority);
+            if (auto r = mNetdSrv->networkAddUidRangesParcel(cfg); !r.isOk()) {
+                return Error() << r.getMessage();
+            }
+            return {};
+        }
+
         const std::string& ifname() { return mIfname; }
         // Assuming mNetId is unique during ResolverMultinetworkTest, make the
         // address based on it to avoid conflicts.
@@ -7202,6 +7227,17 @@ class ResolverMultinetworkTest : public ResolverTest {
         dnsServer->clearQueries();
     }
 
+    static NativeUidRangeConfig makeNativeUidRangeConfig(unsigned netId,
+                                                         std::vector<UidRangeParcel> uidRanges,
+                                                         int32_t subPriority) {
+        NativeUidRangeConfig res;
+        res.netId = netId;
+        res.uidRanges = std::move(uidRanges);
+        res.subPriority = subPriority;
+
+        return res;
+    }
+
   private:
     // Use a different netId because this class inherits from the class ResolverTest which
     // always creates TEST_NETID in setup. It's incremented when CreateScoped{Physical,
@@ -7354,6 +7390,11 @@ void expectDnsWorksForUid(const char* name, unsigned netId, uid_t uid,
     ScopedAddrinfo ai_result(std::move(result.value()));
     std::vector<std::string> result_strs = ToStrings(ai_result);
     EXPECT_THAT(result_strs, testing::UnorderedElementsAreArray(expectedResult));
+}
+
+void expectDnsFailedForUid(const char* name, unsigned netId, uid_t uid) {
+    ScopedChangeUID scopedChangeUID(uid);
+    ASSERT_FALSE(android_getaddrinfofornet_wrapper(name, netId).ok());
 }
 
 }  // namespace
@@ -7886,4 +7927,123 @@ TEST_F(ResolverTest, NetworkUnspecified_localhost) {
     result = safe_getaddrinfo(kIp6LocalHost, nullptr, nullptr);
     EXPECT_TRUE(result != nullptr);
     EXPECT_EQ(kIp6LocalHostAddr, ToString(result));
+}
+
+// Verify uid-based network permission on DNS, which is controlled by INetd::setNetworkAllowlist().
+//
+// Scenario:
+// 1. There are three neworks at the same time:
+//  - system default network
+//  - enterprise network #1
+//  - enterprise network #2
+//
+// 2. Simulate ConnectivityService calling INetd::setNetworkAllowlist so that
+//  - TEST_UID can select only enterprise network #1 and #2. Can not select system default network.
+//  - TEST_UID2 is unrestricted on all networks.
+TEST_F(ResolverMultinetworkTest, UidAllowedNetworks) {
+    // Netd supports it from v13.
+    SKIP_IF_REMOTE_VERSION_LESS_THAN(mDnsClient.netdService(), 13);
+
+    constexpr char host_name[] = "ohayou.example.com.";
+    constexpr char ipv4_addr[] = "192.0.2.0";
+    constexpr char ipv6_addr[] = "2001:db8:cafe:d00d::31";
+
+    const std::pair<ConnectivityType, std::vector<std::string>> testPairs[] = {
+            {ConnectivityType::V4, {ipv4_addr}},
+            {ConnectivityType::V6, {ipv6_addr}},
+            {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
+    };
+    for (const auto& [ipVersion, expectedDnsReply] : testPairs) {
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", ipVersion));
+
+        // Create networks.
+        ScopedPhysicalNetwork sysDefaultNetwork =
+                CreateScopedPhysicalNetwork(ipVersion, "SysDefault");
+        ScopedPhysicalNetwork enterpriseNetwork_1 =
+                CreateScopedPhysicalNetwork(ipVersion, "enterprise_1");
+        ScopedPhysicalNetwork enterpriseNetwork_2 =
+                CreateScopedPhysicalNetwork(ipVersion, "enterprise_2");
+        ASSERT_RESULT_OK(sysDefaultNetwork.init());
+        ASSERT_RESULT_OK(enterpriseNetwork_1.init());
+        ASSERT_RESULT_OK(enterpriseNetwork_2.init());
+
+        // Set up resolver and start forwarding for networks.
+        auto sysDefaultNwDnsSv =
+                setupDns(ipVersion, &sysDefaultNetwork, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(sysDefaultNwDnsSv);
+        auto enterpriseNw1DnsSv =
+                setupDns(ipVersion, &enterpriseNetwork_1, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(enterpriseNw1DnsSv);
+        auto enterpriseNw2DnsSv =
+                setupDns(ipVersion, &enterpriseNetwork_2, host_name, ipv4_addr, ipv6_addr);
+        ASSERT_RESULT_OK(enterpriseNw2DnsSv);
+
+        const unsigned systemDefaultNetId = sysDefaultNetwork.netId();
+        const unsigned enterprise1NetId = enterpriseNetwork_1.netId();
+        const unsigned enterprise2NetId = enterpriseNetwork_2.netId();
+
+        setDefaultNetwork(systemDefaultNetId);
+
+        // We've called setNetworkForProcess in SetupOemNetwork, reset to default first.
+        ScopedSetNetworkForProcess scopedSetNetworkForProcess(NETID_UNSET);
+
+        // Add profile app default network for UID. DNS should be sent on it.
+        // Note: subPriority 20 = PREFERENCE_ORDER_PROFILE, which is defined
+        // in ConnectivityService.java. The value here doesn't really matter.
+        ASSERT_RESULT_OK(enterpriseNetwork_1.addUserFromParcel(TEST_UID, /*subPriority*/ 20));
+        expectDnsWorksForUid(host_name, NETID_UNSET, TEST_UID, expectedDnsReply);
+        expectDnsQueryCountsFn(*enterpriseNw1DnsSv, host_name, expectedDnsReply.size(),
+                               enterprise1NetId);
+
+        // Set allowed networks for UIDs. To simplify test, assumes overall UID range is
+        // {0, 1, 2, ..., TEST_UID2, TEST_UID}.
+        // TEST_UID can't select the system default network. 0 - TEST_UID2 are allowed.
+        NativeUidRangeConfig nwDefaultUserConfig = makeNativeUidRangeConfig(
+                systemDefaultNetId, {makeUidRangeParcel(0, TEST_UID2)}, /*unused*/ 0);
+        // All UIDs can select the enterprise network #1. 0 - TEST_UID are allowed.
+        NativeUidRangeConfig nw1UserConfig = makeNativeUidRangeConfig(
+                enterprise1NetId, {makeUidRangeParcel(0, TEST_UID)}, /*unused*/ 0);
+        // All UIDs can select the enterprise network #2. 0 - TEST_UID are allowed.
+        NativeUidRangeConfig nw2UserConfig = makeNativeUidRangeConfig(
+                enterprise2NetId, {makeUidRangeParcel(0, TEST_UID)}, /*unused*/ 0);
+        EXPECT_TRUE(
+                mDnsClient.netdService()
+                        ->setNetworkAllowlist({nwDefaultUserConfig, nw1UserConfig, nw2UserConfig})
+                        .isOk());
+
+        // Verify that DNS is behaving as the setting.
+        struct TestConfig {
+            int uid;
+            const ScopedNetwork& selectedNetwork;
+            bool expectedSuccess;
+        } configs[]{
+                // clang-format off
+                {TEST_UID, sysDefaultNetwork, false},
+                {TEST_UID, enterpriseNetwork_1, true},
+                {TEST_UID, enterpriseNetwork_2, true},
+                {TEST_UID2, sysDefaultNetwork, true},
+                {TEST_UID2, enterpriseNetwork_1, true},
+                {TEST_UID2, enterpriseNetwork_2, true},
+                // clang-format on
+        };
+        for (const auto& cfg : configs) {
+            SCOPED_TRACE(fmt::format("Dns over UID {}, selectedNetwork {}", cfg.uid,
+                                     cfg.selectedNetwork.name()));
+            if (cfg.expectedSuccess) {
+                expectDnsWorksForUid(host_name, cfg.selectedNetwork.netId(), cfg.uid,
+                                     expectedDnsReply);
+            } else {
+                expectDnsFailedForUid(host_name, cfg.selectedNetwork.netId(), cfg.uid);
+            }
+        }
+
+        // Clear network restrictions.
+        EXPECT_TRUE(mDnsClient.netdService()->setNetworkAllowlist({}).isOk());
+        // TEST_UID and TEST_UID2 can both select all networks.
+        for (const auto& cfg : configs) {
+            SCOPED_TRACE(fmt::format("Dns over UID {}, selectedNetwork {}", cfg.uid,
+                                     cfg.selectedNetwork.name()));
+            expectDnsWorksForUid(host_name, cfg.selectedNetwork.netId(), cfg.uid, expectedDnsReply);
+        }
+    }
 }
