@@ -154,12 +154,17 @@ struct NameserverStats {
         internal_errors = val;
         return *this;
     }
+    NameserverStats& setRttAvg(int val) {
+        rtt_avg = val;
+        return *this;
+    }
 
     const std::string server;
     int successes = 0;
     int errors = 0;
     int timeouts = 0;
     int internal_errors = 0;
+    int rtt_avg = -1;
 };
 
 const bool isAtLeastR = (getApiLevel() >= 30);
@@ -349,7 +354,7 @@ class ResolverTest : public NetNativeTestBase {
             }
             const int index = std::distance(res_servers.begin(), it);
 
-            // The check excludes rtt_avg, last_sample_time, and usable since they will be obsolete
+            // The check excludes last_sample_time and usable since they will be obsolete
             // after |res_stats| is retrieved from NetConfig.dnsStats rather than NetConfig.nsstats.
             switch (cmp) {
                 case StatsCmp::EQ:
@@ -357,12 +362,21 @@ class ResolverTest : public NetNativeTestBase {
                     EXPECT_EQ(res_stats[index].errors, stats.errors);
                     EXPECT_EQ(res_stats[index].timeouts, stats.timeouts);
                     EXPECT_EQ(res_stats[index].internal_errors, stats.internal_errors);
+                    // A negative rtt_avg means that there is no effective rtt in the
+                    // stats. The value should be deterministic.
+                    // See android_net_res_stats_aggregate() for mor details.
+                    if (res_stats[index].rtt_avg < 0 || stats.rtt_avg < 0) {
+                        EXPECT_EQ(res_stats[index].rtt_avg, stats.rtt_avg);
+                    } else {
+                        EXPECT_NEAR(res_stats[index].rtt_avg, stats.rtt_avg, 200);
+                    }
                     break;
                 case StatsCmp::LE:
                     EXPECT_LE(res_stats[index].successes, stats.successes);
                     EXPECT_LE(res_stats[index].errors, stats.errors);
                     EXPECT_LE(res_stats[index].timeouts, stats.timeouts);
                     EXPECT_LE(res_stats[index].internal_errors, stats.internal_errors);
+                    EXPECT_LE(res_stats[index].rtt_avg, stats.rtt_avg);
                     break;
                 default:
                     ADD_FAILURE() << "Unknown comparator " << static_cast<int>(cmp);
@@ -1407,7 +1421,7 @@ TEST_F(ResolverTest, SkipBadServersDueToInternalError) {
         const std::vector<NameserverStats> targetStats = {
                 NameserverStats(listen_addr1).setInternalErrors(5),
                 NameserverStats(listen_addr2).setInternalErrors(5),
-                NameserverStats(listen_addr3).setSuccesses(setupParams.maxSamples),
+                NameserverStats(listen_addr3).setSuccesses(setupParams.maxSamples).setRttAvg(1),
         };
         EXPECT_TRUE(expectStatsNotGreaterThan(targetStats));
 
@@ -1461,7 +1475,7 @@ TEST_F(ResolverTest, SkipBadServersDueToTimeout) {
 
         const std::vector<NameserverStats> targetStats = {
                 NameserverStats(listen_addr1).setTimeouts(5),
-                NameserverStats(listen_addr2).setSuccesses(setupParams.maxSamples),
+                NameserverStats(listen_addr2).setSuccesses(setupParams.maxSamples).setRttAvg(1),
         };
         EXPECT_TRUE(expectStatsNotGreaterThan(targetStats));
 
@@ -1930,7 +1944,7 @@ TEST_F(ResolverTest, ResolverStats) {
     const std::vector<NameserverStats> expectedCleartextDnsStats = {
             NameserverStats(listen_addr1).setTimeouts(1),
             NameserverStats(listen_addr2).setErrors(1),
-            NameserverStats(listen_addr3).setSuccesses(1),
+            NameserverStats(listen_addr3).setSuccesses(1).setRttAvg(1),
     };
     EXPECT_TRUE(expectStatsEqualTo(expectedCleartextDnsStats));
 }
@@ -1988,7 +2002,7 @@ TEST_F(ResolverTest, AlwaysUseLatestSetupParamsInLookups) {
     const std::vector<NameserverStats> expectedCleartextDnsStats = {
             NameserverStats(listen_addr1),
             NameserverStats(listen_addr2),
-            NameserverStats(listen_addr3).setSuccesses(1),
+            NameserverStats(listen_addr3).setSuccesses(1).setRttAvg(1),
     };
     EXPECT_TRUE(expectStatsEqualTo(expectedCleartextDnsStats));
 }
@@ -5535,7 +5549,7 @@ TEST_F(ResolverTest, RepeatedSetup_ResolverStatusRemains) {
     // Check the stats as expected.
     const std::vector<NameserverStats> expectedCleartextDnsStats = {
             NameserverStats(unusable_listen_addr).setInternalErrors(1),
-            NameserverStats(listen_addr).setSuccesses(1),
+            NameserverStats(listen_addr).setSuccesses(1).setRttAvg(1),
     };
     EXPECT_TRUE(expectStatsEqualTo(expectedCleartextDnsStats));
     EXPECT_EQ(GetNumQueries(dns, hostname), 1U);
@@ -6097,6 +6111,12 @@ TEST_P(ResolverParameterizedTest, TruncatedResponse) {
     EXPECT_EQ(1U, GetNumQueriesForProtocol(dns, IPPROTO_TCP, kHelloExampleCom));
 }
 
+// Tests that the DnsResolver can keep listening to the DNS response from previous DNS servers.
+// Test scenarios (The timeout for each server is 1 second):
+//   1. (During the first iteration of DNS servers) While waiting for the DNS response from the
+//      second server, the DnsResolver receives the DNS response from the first server.
+//   2. (During the second iteration of DNS servers) While waiting for the DNS response from the
+//      second server, the DnsResolver receives the DNS response from the first server.
 TEST_F(ResolverTest, KeepListeningUDP) {
     constexpr char listen_addr1[] = "127.0.0.4";
     constexpr char listen_addr2[] = "127.0.0.5";
@@ -6104,43 +6124,68 @@ TEST_F(ResolverTest, KeepListeningUDP) {
     const std::vector<DnsRecord> records = {
             {host_name, ns_type::ns_t_aaaa, "::1.2.3.4"},
     };
-    const std::array<int, IDnsResolver::RESOLVER_PARAMS_COUNT> params = {
-            300, 25, 8, 8, 1000 /* BASE_TIMEOUT_MSEC */, 1 /* retry count */};
-    const int delayTimeMs = 1500;
+    auto builder =
+            ResolverParams::Builder().setDnsServers({listen_addr1, listen_addr2}).setDotServers({});
 
     test::DNSResponder neverRespondDns(listen_addr2, "53", static_cast<ns_rcode>(-1));
     neverRespondDns.setResponseProbability(0.0);
     StartDns(neverRespondDns, records);
-    ScopedSystemProperties scopedSystemProperties(
-            "persist.device_config.netd_native.keep_listening_udp", "1");
-    // Re-setup test network to make experiment flag take effect.
-    resetNetwork();
-
-    ASSERT_TRUE(
-            mDnsClient.SetResolversFromParcel(ResolverParams::Builder()
-                                                      .setDnsServers({listen_addr1, listen_addr2})
-                                                      .setDotServers({})
-                                                      .setParams(params)
-                                                      .build()));
-    // There are 2 DNS servers for this test.
-    // |delayedDns| will be blocked for |delayTimeMs|, then start to respond to requests.
-    // |neverRespondDns| will never respond.
-    // In the first try, resolver will send query to |delayedDns| but get timeout error
-    // because |delayTimeMs| > DNS timeout.
-    // Then it's the second try, resolver will send query to |neverRespondDns| and
-    // listen on both servers. Resolver will receive the answer coming from |delayedDns|.
-
     test::DNSResponder delayedDns(listen_addr1);
-    delayedDns.setResponseDelayMs(delayTimeMs);
     StartDns(delayedDns, records);
 
-    // Specify hints to ensure resolver doing query only 1 round.
-    const addrinfo hints = {.ai_family = AF_INET6, .ai_socktype = SOCK_DGRAM};
-    ScopedAddrinfo result = safe_getaddrinfo(host_name, nullptr, &hints);
-    EXPECT_TRUE(result != nullptr);
+    const struct TestConfig {
+        int retryCount;
+        int delayTimeMs;
+        int expectedDns1Successes;
+        int expectedDns1Timeouts;
+        int expectedDns2Timeouts;
+    } testConfigs[]{
+            {1, 1500, 1, 1, 0},
+            // Actually, there will be two timeouts and one success for DNS1. However, the
+            // DnsResolver doesn't record the stats during the second iteration of DNS servers, so
+            // the success and timeout of DNS1 is 0 and 1, respectively.
+            {2, 3500, 0, 1, 1},
+    };
+    for (const std::string_view callType : {"getaddrinfo", "resnsend"}) {
+        for (const auto& cfg : testConfigs) {
+            SCOPED_TRACE(fmt::format("callType={}, retryCount={}, delayTimeMs={}", callType,
+                                     cfg.retryCount, cfg.delayTimeMs));
+            const std::array<int, IDnsResolver::RESOLVER_PARAMS_COUNT> params = {
+                    300, 25, 8, 8, 1000 /* BASE_TIMEOUT_MSEC */, cfg.retryCount /* retry count */};
 
-    std::string result_str = ToString(result);
-    EXPECT_TRUE(result_str == "::1.2.3.4") << ", result_str='" << result_str << "'";
+            ScopedSystemProperties sp(kKeepListeningUdpFlag, "1");
+            resetNetwork();
+            ASSERT_TRUE(mDnsClient.SetResolversFromParcel(builder.setParams(params).build()));
+
+            delayedDns.setDeferredResp(true);
+            std::thread thread([&]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(cfg.delayTimeMs));
+                delayedDns.setDeferredResp(false);
+            });
+
+            if (callType == "getaddrinfo") {
+                const addrinfo hints = {.ai_family = AF_INET6, .ai_socktype = SOCK_DGRAM};
+                ScopedAddrinfo result = safe_getaddrinfo(host_name, nullptr, &hints);
+                EXPECT_EQ("::1.2.3.4", ToString(result));
+            } else {
+                int fd = resNetworkQuery(TEST_NETID, host_name, ns_c_in, ns_t_aaaa, 0);
+                expectAnswersValid(fd, AF_INET6, "::1.2.3.4");
+            }
+            const std::vector<NameserverStats> expectedCleartextDnsStats = {
+                    NameserverStats(listen_addr1)
+                            .setSuccesses(cfg.expectedDns1Successes)
+                            .setTimeouts(cfg.expectedDns1Timeouts)
+                            // TODO(271406438): Fix the latency bug in the stats and correct the
+                            // value to be 1500.
+                            .setRttAvg(cfg.retryCount == 1 ? 500 : -1),
+                    NameserverStats(listen_addr2)
+                            .setTimeouts(cfg.expectedDns2Timeouts)
+                            .setRttAvg(-1),
+            };
+            EXPECT_TRUE(expectStatsEqualTo(expectedCleartextDnsStats));
+            thread.join();
+        }
+    }
 }
 
 TEST_F(ResolverTest, GetAddrInfoParallelLookupTimeout) {
@@ -6156,8 +6201,7 @@ TEST_F(ResolverTest, GetAddrInfoParallelLookupTimeout) {
     test::DNSResponder neverRespondDns(kDefaultServer, "53", static_cast<ns_rcode>(-1));
     neverRespondDns.setResponseProbability(0.0);
     StartDns(neverRespondDns, records);
-    ScopedSystemProperties scopedSystemProperties(
-            "persist.device_config.netd_native.parallel_lookup_release", "1");
+    ScopedSystemProperties sp(kParallelLookupReleaseFlag, "1");
     // The default value of parallel_lookup_sleep_time should be very small
     // that we can ignore in this test case.
     // Re-setup test network to make experiment flag take effect.
@@ -6191,12 +6235,10 @@ TEST_F(ResolverTest, GetAddrInfoParallelLookupSleepTime) {
             300, 25, 8, 8, 1000 /* BASE_TIMEOUT_MSEC */, 1 /* retry count */};
     test::DNSResponder dns(kDefaultServer);
     StartDns(dns, records);
-    ScopedSystemProperties scopedSystemProperties1(
-            "persist.device_config.netd_native.parallel_lookup_release", "1");
+    ScopedSystemProperties sp1(kParallelLookupReleaseFlag, "1");
     constexpr int PARALLEL_LOOKUP_SLEEP_TIME_MS = 500;
-    ScopedSystemProperties scopedSystemProperties2(
-            "persist.device_config.netd_native.parallel_lookup_sleep_time",
-            std::to_string(PARALLEL_LOOKUP_SLEEP_TIME_MS));
+    ScopedSystemProperties sp2(kParallelLookupSleepTimeFlag,
+                               std::to_string(PARALLEL_LOOKUP_SLEEP_TIME_MS));
     // Re-setup test network to make experiment flag take effect.
     resetNetwork();
 
@@ -6255,7 +6297,9 @@ TEST_F(ResolverTest, BlockDnsQueryUidDoesNotLeadToBadServer) {
     // If api level >= 30 (R+), expect all query packets to be blocked, hence we should not see any
     // of their stats show up. Otherwise, all queries should succeed.
     const std::vector<NameserverStats> expectedDnsStats = {
-            NameserverStats(listen_addr1).setSuccesses(isAtLeastR ? 0 : setupParams.maxSamples),
+            NameserverStats(listen_addr1)
+                    .setSuccesses(isAtLeastR ? 0 : setupParams.maxSamples)
+                    .setRttAvg(isAtLeastR ? -1 : 1),
             NameserverStats(listen_addr2),
     };
     expectStatsEqualTo(expectedDnsStats);
@@ -6413,8 +6457,7 @@ TEST_F(ResolverTest, MdnsGetHostByName) {
     for (int value : keep_listening_udp_enable) {
         if (value == true) {
             // Set keep_listening_udp enable
-            ScopedSystemProperties scopedSystemProperties(
-                    "persist.device_config.netd_native.keep_listening_udp", "1");
+            ScopedSystemProperties sp(kKeepListeningUdpFlag, "1");
             // Re-setup test network to make experiment flag take effect.
             resetNetwork();
         }
@@ -6663,8 +6706,7 @@ TEST_F(ResolverTest, MdnsGetAddrInfo) {
     for (int value : keep_listening_udp_enable) {
         if (value == true) {
             // Set keep_listening_udp enable
-            ScopedSystemProperties scopedSystemProperties(
-                    "persist.device_config.netd_native.keep_listening_udp", "1");
+            ScopedSystemProperties sp(kKeepListeningUdpFlag, "1");
             // Re-setup test network to make experiment flag take effect.
             resetNetwork();
         }
