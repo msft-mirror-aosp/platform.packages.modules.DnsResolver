@@ -53,7 +53,7 @@ cc_library_headers {
     ],
 }
 
-dnsresolver_aidl_interface_lateststable_version = "V10"
+dnsresolver_aidl_interface_lateststable_version = "V11"
 
 cc_library_static {
     name: "dnsresolver_aidl_interface-lateststable-ndk",
@@ -107,6 +107,7 @@ aidl_interface {
         "8",
         "9",
         "10",
+        "11",
     ],
     dumpapi: {
         no_license: true,
@@ -148,6 +149,12 @@ cc_defaults {
             suffix: "64",
         },
     },
+    // 'resolv_test_config_template' used DisableConfigSyncTargetPreparer provided
+    // by net-tests-utils-host-common; adding it to make the host jar available
+    // after the build process.
+    host_required: [
+        "net-tests-utils-host-common",
+    ]
 }
 
 cc_defaults {
@@ -164,6 +171,12 @@ cc_defaults {
             suffix: "64",
         },
     },
+    // 'resolv_test_config_without_root_template' used DisableConfigSyncTargetPreparer
+    // provided by net-tests-utils-host-common; adding it to make the host jar available
+    // after the build process.
+    host_required: [
+        "net-tests-utils-host-common",
+    ]
 }
 
 cc_library {

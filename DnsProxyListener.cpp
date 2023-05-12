@@ -59,6 +59,7 @@
 #include "resolv_private.h"
 #include "stats.h"  // RCODE_TIMEOUT
 #include "stats.pb.h"
+#include "util.h"
 
 using aidl::android::net::metrics::INetdEventListener;
 using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
@@ -79,6 +80,16 @@ namespace {
 constexpr int MAX_QUERIES_PER_UID = 256;
 
 android::netdutils::OperationLimiter<uid_t> queryLimiter(MAX_QUERIES_PER_UID);
+
+bool startQueryLimiter(uid_t uid) {
+    const int globalLimit =
+            android::net::Experiments::getInstance()->getFlag("max_queries_global", INT_MAX);
+    return queryLimiter.start(uid, globalLimit);
+}
+
+void endQueryLimiter(uid_t uid) {
+    queryLimiter.finish(uid);
+}
 
 void logArguments(int argc, char** argv) {
     if (!WOULD_LOG(VERBOSE)) return;
@@ -648,11 +659,20 @@ std::string makeThreadName(unsigned netId, uint32_t uid) {
 }  // namespace
 
 DnsProxyListener::DnsProxyListener() : FrameworkListener(SOCKET_NAME) {
-    registerCmd(new GetAddrInfoCmd());
-    registerCmd(new GetHostByAddrCmd());
-    registerCmd(new GetHostByNameCmd());
-    registerCmd(new ResNSendCommand());
-    registerCmd(new GetDnsNetIdCommand());
+    mGetAddrInfoCmd = std::make_unique<GetAddrInfoCmd>();
+    registerCmd(mGetAddrInfoCmd.get());
+
+    mGetHostByAddrCmd = std::make_unique<GetHostByAddrCmd>();
+    registerCmd(mGetHostByAddrCmd.get());
+
+    mGetHostByNameCmd = std::make_unique<GetHostByNameCmd>();
+    registerCmd(mGetHostByNameCmd.get());
+
+    mResNSendCommand = std::make_unique<ResNSendCommand>();
+    registerCmd(mResNSendCommand.get());
+
+    mGetDnsNetIdCommand = std::make_unique<GetDnsNetIdCommand>();
+    registerCmd(mGetDnsNetIdCommand.get());
 }
 
 void DnsProxyListener::Handler::spawn() {
@@ -678,6 +698,9 @@ DnsProxyListener::GetAddrInfoHandler::GetAddrInfoHandler(SocketClient* c, std::s
       mHints(std::move(hints)),
       mNetContext(netcontext) {}
 
+// Before U, the Netd callback is implemented by OEM to evaluate if a DNS query for the provided
+// hostname is allowed. On U+, the Netd callback also checks if the user is allowed to send DNS on
+// the specified network.
 static bool evaluate_domain_name(const android_net_context& netcontext, const char* host) {
     if (!gResNetdCallbacks.evaluate_domain_name) return true;
     return gResNetdCallbacks.evaluate_domain_name(netcontext, host);
@@ -784,14 +807,14 @@ void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinf
     if (ipv6WantedButNoData) {
         // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
         const uid_t uid = mClient->getUid();
-        if (queryLimiter.start(uid)) {
+        if (startQueryLimiter(uid)) {
             const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
             const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
             mHints->ai_family = AF_INET;
             // Don't need to do freeaddrinfo(res) before starting new DNS lookup because previous
             // DNS lookup is failed with error EAI_NODATA.
             *rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, res, event);
-            queryLimiter.finish(uid);
+            endQueryLimiter(uid);
             if (*rv) {
                 *rv = EAI_NODATA;  // return original error code
                 return;
@@ -825,7 +848,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
         const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
         if (evaluate_domain_name(mNetContext, host)) {
@@ -833,7 +856,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
         } else {
             rv = EAI_SYSTEM;
         }
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
     } else {
         // Note that this error code is currently not passed down to the client.
         // android_getaddrinfo_proxy() returns EAI_NODATA on any error.
@@ -1034,14 +1057,14 @@ void DnsProxyListener::ResNSendHandler::run() {
     int ansLen = -1;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         if (evaluate_domain_name(mNetContext, rr_name.c_str())) {
             ansLen = resolv_res_nsend(&mNetContext, {msg.data(), msgLen}, ansBuf, &rcode,
                                       static_cast<ResNsendFlags>(mFlags), &event);
         } else {
             ansLen = -EAI_SYSTEM;
         }
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
     } else {
         LOG(WARNING) << "ResNSendHandler::run: resnsend: from UID " << uid
                      << ", max concurrent queries reached";
@@ -1210,10 +1233,10 @@ void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hoste
 
     // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
     const uid_t uid = mClient->getUid();
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
         *rv = resolv_gethostbyname(name, AF_INET, hbuf, buf, buflen, &mNetContext, hpp, event);
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
         if (*rv) {
             *rv = EAI_NODATA;  // return original error code
             return;
@@ -1241,7 +1264,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
         if (evaluate_domain_name(mNetContext, name)) {
             rv = resolv_gethostbyname(name, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext, &hp,
@@ -1249,7 +1272,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
         } else {
             rv = EAI_SYSTEM;
         }
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
     } else {
         rv = EAI_MEMORY;
         LOG(ERROR) << "GetHostByNameHandler::run: from UID " << uid
@@ -1372,12 +1395,12 @@ void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(hostent* hbuf,
     }
 
     const uid_t uid = mClient->getUid();
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         // Remove NAT64 prefix and do reverse DNS query
         struct in_addr v4addr = {.s_addr = v6addr.s6_addr32[3]};
         resolv_gethostbyaddr(&v4addr, sizeof(v4addr), AF_INET, hbuf, buf, buflen, &mNetContext, hpp,
                              event);
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
         if (*hpp) {
             // Replace IPv4 address with original queried IPv6 address in place. The space has
             // reserved by dns_gethtbyaddr() and netbsd_gethostent_r() in
@@ -1403,10 +1426,20 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (queryLimiter.start(uid)) {
-        rv = resolv_gethostbyaddr(&mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
-                                  sizeof tmpbuf, &mNetContext, &hp, &event);
-        queryLimiter.finish(uid);
+    if (startQueryLimiter(uid)) {
+        // From Android U, evaluate_domain_name() is not only for OEM customization, but also tells
+        // DNS resolver whether the UID can send DNS on the specified network. The function needs
+        // to be called even when there is no domain name to evaluate (GetHostByAddr). This is
+        // applied on U+ only so that the behavior won’t change on T- OEM devices.
+        // TODO: pass the actual name into evaluate_domain_name, e.g., 238.26.217.172.in-addr.arpa
+        //       when the lookup address is 172.217.26.238.
+        if (isAtLeastU() && !evaluate_domain_name(mNetContext, nullptr)) {
+            rv = EAI_SYSTEM;
+        } else {
+            rv = resolv_gethostbyaddr(&mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
+                                      sizeof tmpbuf, &mNetContext, &hp, &event);
+        }
+        endQueryLimiter(uid);
     } else {
         rv = EAI_MEMORY;
         LOG(ERROR) << "GetHostByAddrHandler::run: from UID " << uid
