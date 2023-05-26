@@ -156,10 +156,9 @@ const std::vector<IPSockAddr> mdns_addrs = {IPSockAddr::toIPSockAddr("ff02::fb",
 
 static int setupUdpSocket(ResState* statp, const sockaddr* sockap, unique_fd* fd_out, int* terrno);
 static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg, span<uint8_t> ans,
-                   int* terrno, size_t* ns, int* v_circuit, int* gotsomewhere, time_t* at,
-                   int* rcode, int* delay);
+                   int* terrno, size_t* ns, int* v_circuit, int* gotsomewhere, int* rcode);
 static int send_vc(ResState* statp, res_params* params, span<const uint8_t> msg, span<uint8_t> ans,
-                   int* terrno, size_t ns, time_t* at, int* rcode, int* delay);
+                   int* terrno, size_t ns, int* rcode);
 static int send_mdns(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* terrno,
                      int* rcode);
 static void dump_error(const char*, const struct sockaddr*);
@@ -173,6 +172,7 @@ static int res_private_dns_send(ResState*, const Slice query, const Slice answer
 static int res_tls_send(const std::list<DnsTlsServer>& tlsServers, ResState*, const Slice query,
                         const Slice answer, int* rcode, PrivateDnsMode mode);
 static ssize_t res_doh_send(ResState*, const Slice query, const Slice answer, int* rcode);
+static int elapsedTimeInMs(const timespec& from);
 
 NsType getQueryType(span<const uint8_t> msg) {
     ns_msg handle;
@@ -580,14 +580,11 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
             if (!usable_servers[ns]) continue;
 
             *rcode = RCODE_INTERNAL_ERROR;
-
-            // Get server addr
-            const IPSockAddr& serverSockAddr = statp->nsaddrs[ns];
             LOG(DEBUG) << __func__ << ": Querying server (# " << ns + 1
-                       << ") address = " << serverSockAddr.toString();
+                       << ") address = " << statp->nsaddrs[ns].toString();
 
             ::android::net::Protocol query_proto = useTcp ? PROTO_TCP : PROTO_UDP;
-            time_t query_time = 0;
+            const time_t query_time = time(nullptr);
             int delay = 0;
             bool fallbackTCP = false;
             const bool shouldRecordStats = (attempt == 0);
@@ -600,8 +597,8 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
             if (useTcp) {
                 // TCP; at most one attempt per server.
                 attempt = retryTimes;
-                resplen =
-                        send_vc(statp, &params, msg, ans, &terrno, ns, &query_time, rcode, &delay);
+                resplen = send_vc(statp, &params, msg, ans, &terrno, ns, rcode);
+                delay = elapsedTimeInMs(statp->tcp_nssock_ts);
 
                 if (msg.size() <= PACKETSZ && resplen <= 0 &&
                     statp->tc_mode == aidl::android::net::IDnsResolver::TC_MODE_UDP_TCP) {
@@ -613,7 +610,8 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
             } else {
                 // UDP
                 resplen = send_dg(statp, &params, msg, ans, &terrno, &actualNs, &useTcp,
-                                  &gotsomewhere, &query_time, rcode, &delay);
+                                  &gotsomewhere, rcode);
+                delay = elapsedTimeInMs(statp->udpsocks_ts[actualNs]);
                 fallbackTCP = useTcp ? true : false;
                 retry_count_for_event = attempt;
                 LOG(INFO) << __func__ << ": used send_dg " << resplen << " terrno: " << terrno;
@@ -647,11 +645,9 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
                 if (!isNetworkRestricted(terrno)) {
                     res_sample sample;
                     res_stats_set_sample(&sample, query_time, *rcode, delay);
-                    // KeepListening UDP mechanism is incompatible with usable_servers of legacy
-                    // stats, so keep the old logic for now.
-                    // TODO: Replace usable_servers of legacy stats with new one.
-                    resolv_cache_add_resolver_stats_sample(
-                            statp->netid, revision_id, serverSockAddr, sample, params.max_samples);
+                    resolv_cache_add_resolver_stats_sample(statp->netid, revision_id,
+                                                           receivedServerAddr, sample,
+                                                           params.max_samples);
                     resolv_stats_add(statp->netid, receivedServerAddr, dnsQueryEvent);
                 }
             }
@@ -710,9 +706,7 @@ static struct timespec get_timeout(ResState* statp, const res_params* params, co
 }
 
 static int send_vc(ResState* statp, res_params* params, span<const uint8_t> msg, span<uint8_t> ans,
-                   int* terrno, size_t ns, time_t* at, int* rcode, int* delay) {
-    *at = time(NULL);
-    *delay = 0;
+                   int* terrno, size_t ns, int* rcode) {
     const HEADER* hp = (const HEADER*)(const void*)msg.data();
     HEADER* anhp = (HEADER*)(void*)ans.data();
     struct sockaddr* nsap;
@@ -736,8 +730,6 @@ static int send_vc(ResState* statp, res_params* params, span<const uint8_t> msg,
     connreset = 0;
 same_ns:
     truncating = 0;
-
-    struct timespec start_time = evNowTime();
 
     /* Are we still talking to whom we want to talk to? */
     if (statp->tcp_nssock >= 0 && (statp->flags & RES_F_VC) != 0) {
@@ -769,6 +761,7 @@ same_ns:
                     return -1;
             }
         }
+        statp->tcp_nssock_ts = evNowTime();
         const uid_t uid = statp->enforce_dns_uid ? AID_DNS : statp->uid;
         resolv_tag_socket(statp->tcp_nssock, uid, statp->pid);
         if (statp->mark != MARK_UNSET) {
@@ -914,8 +907,6 @@ read_len:
      * next nameserver ought not be tried.
      */
     if (resplen > 0) {
-        struct timespec done = evNowTime();
-        *delay = res_stats_calculate_rtt(&done, &start_time);
         *rcode = anhp->rcode;
     }
     *terrno = 0;
@@ -1092,8 +1083,7 @@ static int setupUdpSocket(ResState* statp, const sockaddr* sockap, unique_fd* fd
 }
 
 static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg, span<uint8_t> ans,
-                   int* terrno, size_t* ns, int* v_circuit, int* gotsomewhere, time_t* at,
-                   int* rcode, int* delay) {
+                   int* terrno, size_t* ns, int* v_circuit, int* gotsomewhere, int* rcode) {
     // It should never happen, but just in case.
     if (*ns >= statp->nsaddrs.size()) {
         LOG(ERROR) << __func__ << ": Out-of-bound indexing: " << ns;
@@ -1101,14 +1091,13 @@ static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg,
         return -1;
     }
 
-    *at = time(nullptr);
-    *delay = 0;
     const sockaddr_storage ss = statp->nsaddrs[*ns];
     const sockaddr* nsap = reinterpret_cast<const sockaddr*>(&ss);
 
     if (statp->udpsocks[*ns] == -1) {
         int result = setupUdpSocket(statp, nsap, &statp->udpsocks[*ns], terrno);
         if (result <= 0) return result;
+        statp->udpsocks_ts[*ns] = evNowTime();
 
         // Use a "connected" datagram socket to receive an ECONNREFUSED error
         // on the next socket operation when the server responds with an
@@ -1187,8 +1176,6 @@ static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg,
                 continue;
             }
 
-            timespec done = evNowTime();
-            *delay = res_stats_calculate_rtt(&done, &start_time);
             if (anhp->rcode == SERVFAIL || anhp->rcode == NOTIMP || anhp->rcode == REFUSED) {
                 LOG(DEBUG) << __func__ << ": server rejected query:";
                 res_pquery({ans.data(), (resplen > ans.size()) ? ans.size() : resplen});
@@ -1472,4 +1459,10 @@ int resolv_res_nsend(const android_net_context* netContext, span<const uint8_t> 
     resolv_populate_res_for_net(&res);
     *rcode = NOERROR;
     return res_nsend(&res, msg, ans, rcode, flags);
+}
+
+// Returns the elapsed time in milliseconds since the given time `from`.
+int elapsedTimeInMs(const timespec& from) {
+    const timespec now = evNowTime();
+    return res_stats_calculate_rtt(&now, &from);
 }
