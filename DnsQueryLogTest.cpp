@@ -23,6 +23,7 @@
 #include <netdutils/NetNativeTestBase.h>
 
 #include "DnsQueryLog.h"
+#include "tests/resolv_test_utils.h"
 
 using namespace std::chrono_literals;
 
@@ -140,26 +141,37 @@ TEST_F(DnsQueryLogTest, CapacityFull) {
     verifyDumpOutput(output, expectedNetIds);
 }
 
-TEST_F(DnsQueryLogTest, ValidityTime) {
-    DnsQueryLog::Record r1(30, 1000, 1000, "www.example.com", serversV4, 10);
-    DnsQueryLog queryLog(3, 100ms);
-    queryLog.push(std::move(r1));
+TEST_F(DnsQueryLogTest, SizeCustomization) {
+    const size_t logSize = 3;
+    const ScopedSystemProperties sp(kQueryLogSize, std::to_string(logSize));
+    DnsQueryLog queryLog;
 
-    // Dump the output and verify the correctness by checking netId.
-    std::string output = captureDumpOutput(queryLog);
-    verifyDumpOutput(output, {30});
+    for (int i = 0; i < 200; i++) {
+        DnsQueryLog::Record record(30, 1000, 1000, "www.example.com", serversV4, 10);
+        queryLog.push(std::move(record));
+    }
 
-    std::this_thread::sleep_for(150ms);
+    // Verify that there are exact customized number of records in queryLog.
+    const std::string output = captureDumpOutput(queryLog);
+    verifyDumpOutput(output, std::vector(logSize, 30));
+}
 
-    // The record is expired thus not shown in the output.
-    output = captureDumpOutput(queryLog);
-    verifyDumpOutput(output, {});
+TEST_F(DnsQueryLogTest, InvalidSizeCustomization) {
+    // The max log size defined in DnsQueryLog.h is 10000.
+    for (const auto& logSize : {"-1", "10001", "non-digit"}) {
+        const ScopedSystemProperties sp(kQueryLogSize, logSize);
+        DnsQueryLog queryLog;
 
-    // Push another record to ensure it still works.
-    DnsQueryLog::Record r2(31, 1000, 1000, "example.com", serversV4V6, 10);
-    queryLog.push(std::move(r2));
-    output = captureDumpOutput(queryLog);
-    verifyDumpOutput(output, {31});
+        for (int i = 0; i < 300; i++) {
+            DnsQueryLog::Record record(30, 1000, 1000, "www.example.com", serversV4, 10);
+            queryLog.push(std::move(record));
+        }
+
+        // Verify that queryLog has the default number of records. The default size defined in
+        // DnsQueryLog.h is 200.
+        const std::string output = captureDumpOutput(queryLog);
+        verifyDumpOutput(output, std::vector(200, 30));
+    }
 }
 
 }  // namespace android::net
