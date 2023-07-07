@@ -44,8 +44,8 @@ cc_library_headers {
 
 cc_library_headers {
     name: "dnsproxyd_protocol_headers",
-    sdk_version: "29",
-    min_sdk_version: "29",
+    sdk_version: "30",
+    min_sdk_version: "30",
     export_include_dirs: ["include/dnsproxyd_protocol"],
     apex_available: [
         "//apex_available:platform",
@@ -63,7 +63,7 @@ cc_library_static {
     apex_available: [
         "com.android.resolv",
     ],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 aidl_interface {
@@ -93,7 +93,7 @@ aidl_interface {
             apex_available: [
                 "com.android.resolv",
             ],
-            min_sdk_version: "29",
+            min_sdk_version: "30",
         },
     },
     versions: [
@@ -129,7 +129,7 @@ cc_defaults {
         "liblog",
     ],
     // This field is required to make test compatible with Q devices.
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 cc_defaults {
@@ -249,14 +249,10 @@ cc_library {
         "libcrypto",
         "liblog", //Used by libstatslog_resolv
         "libssl",
+        "libstatssocket",
     ],
     header_libs: [
         "libnetdbinder_utils_headers",
-    ],
-    runtime_libs: [
-        // Causes the linkerconfig to create a namespace link from resolv to the
-        // libstatssocket library within the statsd apex
-        "libstatssocket",
     ],
     export_include_dirs: ["include"],
 
@@ -275,7 +271,7 @@ cc_library {
         cfi: true,
     },
     apex_available: ["com.android.resolv"],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 cc_library_static {
@@ -289,7 +285,7 @@ cc_library_static {
         "stats.proto",
     ],
     apex_available: ["com.android.resolv"],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 genrule {
@@ -326,7 +322,7 @@ cc_library_static {
         "libgtest_prod_headers", // Used by libstatspush_compat
     ],
     apex_available: ["com.android.resolv"],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 filegroup {
@@ -362,6 +358,7 @@ doh_rust_deps = [
     "liblibc",
     "liblog_rust",
     "libring",
+    "libstatslog_rust",
     "libthiserror",
     "libtokio",
     "liburl",
@@ -385,7 +382,7 @@ rust_ffi_static {
         "//apex_available:platform", // Needed by doh_ffi_test
         "com.android.resolv",
     ],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 rust_test {
@@ -396,7 +393,7 @@ rust_test {
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rustlibs: doh_rust_deps + ["libquiche_static"],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 // It's required by unit tests.
@@ -408,6 +405,11 @@ rust_ffi_static {
 
     rlibs: doh_rust_deps + ["libquiche_static"],
     prefer_rlib: true,
+
+    shared_libs: [
+        "libstatssocket",
+    ],
+
     // TODO(b/194022174), for unit tests to run on the Android 10 platform,
     // libunwind must be statically linked.
     whole_static_libs: ["libunwind"],
@@ -415,7 +417,7 @@ rust_ffi_static {
         "//apex_available:platform", // Needed by doh_ffi_test
         "com.android.resolv",
     ],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 rust_ffi_static {
@@ -438,6 +440,7 @@ rust_ffi_static {
         "liblog_rust",
         "libquiche_static",
         "libring",
+        "libstatslog_rust",
         "libthiserror",
         "libtokio",
         "liburl",
