@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-use crate::dns_https_frontend::DohFrontend;
-use crate::stats::Stats;
+use super::dns_https_frontend::DohFrontend;
+use super::stats::Stats;
 
 use anyhow::{bail, Result};
 use libc::c_char;
@@ -79,7 +79,7 @@ pub extern "C" fn frontend_stop(doh: &mut DohFrontend) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn frontend_delete(doh: *mut DohFrontend) {
     if !doh.is_null() {
-        Box::from_raw(doh);
+        drop(Box::from_raw(doh));
     }
 }
 
@@ -151,6 +151,14 @@ pub extern "C" fn frontend_set_max_streams_bidi(doh: &mut DohFrontend, value: u6
 #[no_mangle]
 pub extern "C" fn frontend_block_sending(doh: &mut DohFrontend, block: bool) -> bool {
     doh.block_sending(block).or_else(logging_and_return_err).is_ok()
+}
+
+/// If this function is called, the `DohFrontend` will send RESET_STREAM frame as a response
+/// instead of a DoH answer on the stream |stream_id|. This will make the client fail to receive
+/// this DoH answer.
+#[no_mangle]
+pub extern "C" fn frontend_set_reset_stream_id(doh: &mut DohFrontend, stream_id: u64) -> bool {
+    doh.set_reset_stream_id(stream_id).or_else(logging_and_return_err).is_ok()
 }
 
 /// Gets the statistics of the `DohFrontend` and writes the result to |out|.

@@ -70,9 +70,6 @@ using aidl::android::net::ResolverOptionsParcel;
 using android::net::DnsQueryEvent;
 using android::net::DnsStats;
 using android::net::Experiments;
-using android::net::PROTO_DOH;
-using android::net::PROTO_DOT;
-using android::net::PROTO_MDNS;
 using android::net::PROTO_TCP;
 using android::net::PROTO_UDP;
 using android::net::Protocol;
@@ -156,7 +153,9 @@ using std::span;
  * * Upping by another 5x for the centralized nature
  * *****************************************
  */
-const int CONFIG_MAX_ENTRIES = 64 * 2 * 5;
+const int MAX_ENTRIES_DEFAULT = 64 * 2 * 5;
+const int MAX_ENTRIES_LOWER_BOUND = 0;
+const int MAX_ENTRIES_UPPER_BOUND = 100 * 1000;
 constexpr int DNSEVENT_SUBSAMPLING_MAP_DEFAULT_KEY = -1;
 
 static time_t _time_now(void) {
@@ -950,14 +949,14 @@ std::unordered_map<int, uint32_t> resolv_get_dns_event_subsampling_map(bool isMd
 //
 // TODO: move all cache manipulation code here and make data members private.
 struct Cache {
-    Cache() {
-        entries.resize(CONFIG_MAX_ENTRIES);
+    Cache() : max_cache_entries(get_max_cache_entries_from_flag()) {
+        entries.resize(max_cache_entries);
         mru_list.mru_prev = mru_list.mru_next = &mru_list;
     }
     ~Cache() { flush(); }
 
     void flush() {
-        for (int nn = 0; nn < CONFIG_MAX_ENTRIES; nn++) {
+        for (int nn = 0; nn < max_cache_entries; nn++) {
             Entry** pnode = (Entry**)&entries[nn];
 
             while (*pnode) {
@@ -988,6 +987,8 @@ struct Cache {
         cv.notify_all();
     }
 
+    int get_max_cache_entries() { return max_cache_entries; }
+
     int num_entries = 0;
 
     // TODO: convert to std::list
@@ -1000,6 +1001,21 @@ struct Cache {
         unsigned int hash;
         struct pending_req_info* next;
     } pending_requests{};
+
+  private:
+    int get_max_cache_entries_from_flag() {
+        int entries = android::net::Experiments::getInstance()->getFlag("max_cache_entries",
+                                                                        MAX_ENTRIES_DEFAULT);
+        // Check both lower and upper bounds to prevent irrational values mistakenly pushed by
+        // server.
+        if (entries < MAX_ENTRIES_LOWER_BOUND || entries > MAX_ENTRIES_UPPER_BOUND) {
+            LOG(ERROR) << "Misconfiguration on max_cache_entries " << entries;
+            entries = MAX_ENTRIES_DEFAULT;
+        }
+        return entries;
+    }
+
+    const int max_cache_entries;
 };
 
 struct NetConfig {
@@ -1142,7 +1158,7 @@ static void cache_dump_mru_locked(Cache* cache) {
  * table.
  */
 static Entry** _cache_lookup_p(Cache* cache, Entry* key) {
-    int index = key->hash % CONFIG_MAX_ENTRIES;
+    int index = key->hash % cache->get_max_cache_entries();
     Entry** pnode = (Entry**) &cache->entries[index];
 
     while (*pnode != NULL) {
@@ -1269,32 +1285,31 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
 
         if (!cache_has_pending_request_locked(cache, &key, true)) {
             return RESOLV_CACHE_NOTFOUND;
+        }
 
-        } else {
-            LOG(INFO) << __func__ << ": Waiting for previous request";
-            // wait until (1) timeout OR
-            //            (2) cv is notified AND no pending request matching the |key|
-            // (cv notifier should delete pending request before sending notification.)
-            bool ret = cv.wait_for(lock, std::chrono::seconds(PENDING_REQUEST_TIMEOUT),
-                                   [netid, &cache, &key]() REQUIRES(cache_mutex) {
-                                       // Must update cache as it could have been deleted
-                                       cache = find_named_cache_locked(netid);
-                                       return !cache_has_pending_request_locked(cache, &key, false);
-                                   });
-            if (!cache) {
-                return RESOLV_CACHE_NOTFOUND;
+        LOG(INFO) << __func__ << ": Waiting for previous request";
+        // wait until (1) timeout OR
+        //            (2) cv is notified AND no pending request matching the |key|
+        // (cv notifier should delete pending request before sending notification.)
+        const bool ret = cv.wait_for(lock, std::chrono::seconds(PENDING_REQUEST_TIMEOUT),
+                                [netid, &cache, &key]() REQUIRES(cache_mutex) {
+                                    // Must update cache as it could have been deleted
+                                    cache = find_named_cache_locked(netid);
+                                    return !cache_has_pending_request_locked(cache, &key, false);
+                                });
+        if (!cache) {
+            return RESOLV_CACHE_NOTFOUND;
+        }
+        if (ret == false) {
+            NetConfig* info = find_netconfig_locked(netid);
+            if (info != NULL) {
+                info->wait_for_pending_req_timeout_count++;
             }
-            if (ret == false) {
-                NetConfig* info = find_netconfig_locked(netid);
-                if (info != NULL) {
-                    info->wait_for_pending_req_timeout_count++;
-                }
-            }
-            lookup = _cache_lookup_p(cache, &key);
-            e = *lookup;
-            if (e == NULL) {
-                return RESOLV_CACHE_NOTFOUND;
-            }
+        }
+        lookup = _cache_lookup_p(cache, &key);
+        e = *lookup;
+        if (e == NULL) {
+            return RESOLV_CACHE_NOTFOUND;
         }
     }
 
@@ -1358,9 +1373,9 @@ int resolv_cache_add(unsigned netid, span<const uint8_t> query, span<const uint8
         return -EEXIST;
     }
 
-    if (cache->num_entries >= CONFIG_MAX_ENTRIES) {
+    if (cache->num_entries >= cache->get_max_cache_entries()) {
         _cache_remove_expired(cache);
-        if (cache->num_entries >= CONFIG_MAX_ENTRIES) {
+        if (cache->num_entries >= cache->get_max_cache_entries()) {
             _cache_remove_oldest(cache);
         }
         // TODO: It looks useless, remove below code after having test to prove it.
@@ -1542,17 +1557,6 @@ static NetConfig* find_netconfig_locked(unsigned netid) {
     return nullptr;
 }
 
-static void resolv_set_experiment_params(res_params* params) {
-    if (params->retry_count == 0) {
-        params->retry_count = getExperimentFlagInt("retry_count", RES_DFLRETRY);
-    }
-
-    if (params->base_timeout_msec == 0) {
-        params->base_timeout_msec =
-                getExperimentFlagInt("retransmission_time_interval", RES_TIMEOUT);
-    }
-}
-
 android::net::NetworkType resolv_get_network_types_for_net(unsigned netid) {
     std::lock_guard guard(cache_mutex);
     NetConfig* netconfig = find_netconfig_locked(netid);
@@ -1660,7 +1664,20 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
 
     uint8_t old_max_samples = netconfig->params.max_samples;
     netconfig->params = params;
-    resolv_set_experiment_params(&netconfig->params);
+
+    // This check must always be true, but add a protection against OEMs configure negative values
+    // for retry_count and base_timeout_msec.
+    if (netconfig->params.retry_count == 0) {
+        const int retryCount = Experiments::getInstance()->getFlag("retry_count", RES_DFLRETRY);
+        netconfig->params.retry_count = (retryCount <= 0) ? RES_DFLRETRY : retryCount;
+    }
+    if (netconfig->params.base_timeout_msec == 0) {
+        const int retransmissionInterval =
+                Experiments::getInstance()->getFlag("retransmission_time_interval", RES_TIMEOUT);
+        netconfig->params.base_timeout_msec =
+                (retransmissionInterval <= 0) ? RES_TIMEOUT : retransmissionInterval;
+    }
+
     if (!resolv_is_nameservers_equal(netconfig->nameservers, nameservers)) {
         // free current before adding new
         free_nameservers_locked(netconfig);
@@ -1936,29 +1953,16 @@ int resolv_cache_get_expiration(unsigned netid, span<const uint8_t> query, time_
     return 0;
 }
 
-static const char* protocol_to_str(const Protocol proto) {
-    switch (proto) {
-        case PROTO_UDP:
-            return "UDP";
-        case PROTO_TCP:
-            return "TCP";
-        case PROTO_DOT:
-            return "DOT";
-        case PROTO_DOH:
-            return "DOH";
-        case PROTO_MDNS:
-            return "MDNS";
-        default:
-            return "UNKNOWN";
-    }
-}
-
 int resolv_stats_set_addrs(unsigned netid, Protocol proto, const std::vector<std::string>& addrs,
                            int port) {
     std::lock_guard guard(cache_mutex);
     const auto info = find_netconfig_locked(netid);
 
-    if (info == nullptr) return -ENONET;
+    if (info == nullptr) {
+        LOG(WARNING) << __func__ << ": Network " << netid << " not found for "
+                     << Protocol_Name(proto);
+        return -ENONET;
+    }
 
     std::vector<IPSockAddr> sockAddrs;
     sockAddrs.reserve(addrs.size());
@@ -1967,8 +1971,8 @@ int resolv_stats_set_addrs(unsigned netid, Protocol proto, const std::vector<std
     }
 
     if (!info->dnsStats.setAddrs(sockAddrs, proto)) {
-        LOG(WARNING) << __func__ << ": netid = " << netid << ", failed to set "
-                     << protocol_to_str(proto) << " stats";
+        LOG(WARNING) << __func__ << ": Failed to set " << Protocol_Name(proto) << " on network "
+                     << netid;
         return -EINVAL;
     }
 
@@ -2087,4 +2091,14 @@ void resolv_netconfig_dump(DumpWriter& dw, unsigned netid) {
         dw.println("TC mode: %s", tc_mode_to_str(info->tc_mode));
         dw.println("TransportType: %s", transport_type_to_str(info->transportTypes));
     }
+}
+
+int resolv_get_max_cache_entries(unsigned netid) {
+    std::lock_guard guard(cache_mutex);
+    NetConfig* info = find_netconfig_locked(netid);
+    if (!info) {
+        LOG(WARNING) << __func__ << ": NetConfig for netid " << netid << " not found";
+        return -1;
+    }
+    return info->cache->get_max_cache_entries();
 }

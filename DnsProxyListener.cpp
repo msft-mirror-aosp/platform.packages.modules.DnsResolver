@@ -18,7 +18,6 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
-#include <errno.h>
 #include <linux/if.h>
 #include <math.h>
 #include <net/if.h>
@@ -34,6 +33,7 @@
 #include <algorithm>
 #include <vector>
 
+#include <android-base/parseint.h>
 #include <android/multinetwork.h>  // ResNsendFlags
 #include <cutils/misc.h>           // FIRST_APPLICATION_UID
 #include <cutils/multiuser.h>
@@ -59,10 +59,13 @@
 #include "resolv_private.h"
 #include "stats.h"  // RCODE_TIMEOUT
 #include "stats.pb.h"
+#include "util.h"
 
 using aidl::android::net::metrics::INetdEventListener;
 using aidl::android::net::resolv::aidl::DnsHealthEventParcel;
 using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
+using android::base::ParseInt;
+using android::base::ParseUint;
 using std::span;
 
 namespace android {
@@ -77,6 +80,16 @@ namespace {
 constexpr int MAX_QUERIES_PER_UID = 256;
 
 android::netdutils::OperationLimiter<uid_t> queryLimiter(MAX_QUERIES_PER_UID);
+
+bool startQueryLimiter(uid_t uid) {
+    const int globalLimit =
+            android::net::Experiments::getInstance()->getFlag("max_queries_global", INT_MAX);
+    return queryLimiter.start(uid, globalLimit);
+}
+
+void endQueryLimiter(uid_t uid) {
+    queryLimiter.finish(uid);
+}
 
 void logArguments(int argc, char** argv) {
     if (!WOULD_LOG(VERBOSE)) return;
@@ -235,23 +248,9 @@ int resNSendToAiError(int err, int rcode) {
     return EAI_SYSTEM;
 }
 
-template <typename IntegralType>
-bool simpleStrtoul(const char* input, IntegralType* output, int base = 10) {
-    char* endPtr;
-    errno = 0;
-    auto result = strtoul(input, &endPtr, base);
-    // Check the length in order to ensure there is no "-" sign
-    if (!*input || *endPtr || (endPtr - input) != static_cast<ptrdiff_t>(strlen(input)) ||
-        (errno == ERANGE && (result == ULONG_MAX))) {
-        return false;
-    }
-    *output = result;
-    return true;
-}
-
 bool setQueryId(span<uint8_t> msg, uint16_t query_id) {
     if ((size_t)msg.size() < sizeof(HEADER)) {
-        errno = EINVAL;
+        LOG(ERROR) << __func__ << ": Invalid parameter";
         return false;
     }
     auto hp = reinterpret_cast<HEADER*>(msg.data());
@@ -275,17 +274,9 @@ bool parseQuery(span<const uint8_t> msg, uint16_t* query_id, int* rr_type, std::
 // Note: Even if it returns PDM_OFF, it doesn't mean there's no DoT stats in the message
 // because Private DNS mode can change at any time.
 PrivateDnsModes getPrivateDnsModeForMetrics(uint32_t netId) {
-    switch (PrivateDnsConfiguration::getInstance().getStatus(netId).mode) {
-        case PrivateDnsMode::OFF:
-            // It can also be due to netId not found.
-            return PrivateDnsModes::PDM_OFF;
-        case PrivateDnsMode::OPPORTUNISTIC:
-            return PrivateDnsModes::PDM_OPPORTUNISTIC;
-        case PrivateDnsMode::STRICT:
-            return PrivateDnsModes::PDM_STRICT;
-        default:
-            return PrivateDnsModes::PDM_UNKNOWN;
-    }
+    // If the network `netId` doesn't exist, getStatus() sets the mode to PrivateDnsMode::OFF and
+    // returns it. This is incorrect for the metrics. Consider returning PDM_UNKNOWN in such case.
+    return convertEnumType(PrivateDnsConfiguration::getInstance().getStatus(netId).mode);
 }
 
 void initDnsEvent(NetworkDnsEventReported* event, const android_net_context& netContext) {
@@ -464,9 +455,12 @@ void logDnsQueryResult(const addrinfo* res) {
     LOG(DEBUG) << __func__ << ": DNS records:";
     for (ai = res, i = 0; ai; ai = ai->ai_next, i++) {
         if ((ai->ai_family != AF_INET) && (ai->ai_family != AF_INET6)) continue;
+        // Reassign it to a local variable to avoid -Wnullable-to-nonnull-conversion on calling
+        // getnameinfo.
+        const sockaddr* ai_addr = ai->ai_addr;
         char ip_addr[INET6_ADDRSTRLEN];
-        int ret = getnameinfo(ai->ai_addr, ai->ai_addrlen, ip_addr, sizeof(ip_addr), nullptr, 0,
-                              NI_NUMERICHOST);
+        const int ret = getnameinfo(ai_addr, ai->ai_addrlen, ip_addr, sizeof(ip_addr), nullptr, 0,
+                                    NI_NUMERICHOST);
         if (!ret) {
             LOG(DEBUG) << __func__ << ": [" << i << "] " << ai->ai_flags << " " << ai->ai_family
                        << " " << ai->ai_socktype << " " << ai->ai_protocol << " " << ip_addr;
@@ -582,7 +576,10 @@ bool synthesizeNat64PrefixWithARecord(const netdutils::IPPrefix& prefix, addrinf
         sa->ai_next = nullptr;
 
         if (cur4->ai_canonname != nullptr) {
-            sa->ai_canonname = strdup(cur4->ai_canonname);
+            // Reassign it to a local variable to avoid -Wnullable-to-nonnull-conversion on calling
+            // strdup.
+            const char* ai_canonname = cur4->ai_canonname;
+            sa->ai_canonname = strdup(ai_canonname);
             if (sa->ai_canonname == nullptr) {
                 LOG(ERROR) << "allocate memory failed for canonname";
                 freeaddrinfo(sa);
@@ -668,11 +665,20 @@ std::string makeThreadName(unsigned netId, uint32_t uid) {
 }  // namespace
 
 DnsProxyListener::DnsProxyListener() : FrameworkListener(SOCKET_NAME) {
-    registerCmd(new GetAddrInfoCmd());
-    registerCmd(new GetHostByAddrCmd());
-    registerCmd(new GetHostByNameCmd());
-    registerCmd(new ResNSendCommand());
-    registerCmd(new GetDnsNetIdCommand());
+    mGetAddrInfoCmd = std::make_unique<GetAddrInfoCmd>();
+    registerCmd(mGetAddrInfoCmd.get());
+
+    mGetHostByAddrCmd = std::make_unique<GetHostByAddrCmd>();
+    registerCmd(mGetHostByAddrCmd.get());
+
+    mGetHostByNameCmd = std::make_unique<GetHostByNameCmd>();
+    registerCmd(mGetHostByNameCmd.get());
+
+    mResNSendCommand = std::make_unique<ResNSendCommand>();
+    registerCmd(mResNSendCommand.get());
+
+    mGetDnsNetIdCommand = std::make_unique<GetDnsNetIdCommand>();
+    registerCmd(mGetDnsNetIdCommand.get());
 }
 
 void DnsProxyListener::Handler::spawn() {
@@ -693,14 +699,28 @@ DnsProxyListener::GetAddrInfoHandler::GetAddrInfoHandler(SocketClient* c, std::s
                                                          std::unique_ptr<addrinfo> hints,
                                                          const android_net_context& netcontext)
     : Handler(c),
-      mHost(move(host)),
-      mService(move(service)),
-      mHints(move(hints)),
+      mHost(std::move(host)),
+      mService(std::move(service)),
+      mHints(std::move(hints)),
       mNetContext(netcontext) {}
 
+// Before U, the Netd callback is implemented by OEM to evaluate if a DNS query for the provided
+// hostname is allowed. On U+, the Netd callback also checks if the user is allowed to send DNS on
+// the specified network.
 static bool evaluate_domain_name(const android_net_context& netcontext, const char* host) {
     if (!gResNetdCallbacks.evaluate_domain_name) return true;
     return gResNetdCallbacks.evaluate_domain_name(netcontext, host);
+}
+
+static int HandleArgumentError(SocketClient* cli, int errorcode, std::string strerrormessage,
+                               int argc, char** argv) {
+    for (int i = 0; i < argc; i++) {
+        strerrormessage += "argv[" + std::to_string(i) + "]=" + (argv[i] ? argv[i] : "null") + " ";
+    }
+
+    LOG(WARNING) << strerrormessage;
+    cli->sendMsg(errorcode, strerrormessage.c_str(), false);
+    return -1;
 }
 
 static bool sendBE32(SocketClient* c, uint32_t data) {
@@ -719,13 +739,15 @@ static bool sendhostent(SocketClient* c, hostent* hp) {
     bool success = true;
     int i;
     if (hp->h_name != nullptr) {
-        success &= sendLenAndData(c, strlen(hp->h_name) + 1, hp->h_name);
+        const char* h_name = hp->h_name;
+        success &= sendLenAndData(c, strlen(h_name) + 1, hp->h_name);
     } else {
         success &= sendLenAndData(c, 0, "") == 0;
     }
 
     for (i = 0; hp->h_aliases[i] != nullptr; i++) {
-        success &= sendLenAndData(c, strlen(hp->h_aliases[i]) + 1, hp->h_aliases[i]);
+        const char* h_aliases = hp->h_aliases[i];
+        success &= sendLenAndData(c, strlen(h_aliases) + 1, hp->h_aliases[i]);
     }
     success &= sendLenAndData(c, 0, "");  // null to indicate we're done
 
@@ -768,7 +790,12 @@ static bool sendaddrinfo(SocketClient* c, addrinfo* ai) {
     }
 
     // strlen(ai_canonname) and ai_canonname.
-    if (!sendLenAndData(c, ai->ai_canonname ? strlen(ai->ai_canonname) + 1 : 0, ai->ai_canonname)) {
+    int len = 0;
+    if (ai->ai_canonname != nullptr) {
+        const char* ai_canonname = ai->ai_canonname;
+        len = strlen(ai_canonname) + 1;
+    }
+    if (!sendLenAndData(c, len, ai->ai_canonname)) {
         return false;
     }
 
@@ -793,14 +820,14 @@ void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinf
     if (ipv6WantedButNoData) {
         // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
         const uid_t uid = mClient->getUid();
-        if (queryLimiter.start(uid)) {
+        if (startQueryLimiter(uid)) {
             const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
             const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
             mHints->ai_family = AF_INET;
             // Don't need to do freeaddrinfo(res) before starting new DNS lookup because previous
             // DNS lookup is failed with error EAI_NODATA.
             *rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, res, event);
-            queryLimiter.finish(uid);
+            endQueryLimiter(uid);
             if (*rv) {
                 *rv = EAI_NODATA;  // return original error code
                 return;
@@ -825,9 +852,7 @@ void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinf
 }
 
 void DnsProxyListener::GetAddrInfoHandler::run() {
-    LOG(INFO) << "GetAddrInfoHandler::run: {" << mNetContext.app_netid << " "
-              << mNetContext.app_mark << " " << mNetContext.dns_netid << " " << mNetContext.dns_mark
-              << " " << mNetContext.uid << " " << mNetContext.flags << "}";
+    LOG(INFO) << "GetAddrInfoHandler::run: {" << mNetContext.toString() << "}";
 
     addrinfo* result = nullptr;
     Stopwatch s;
@@ -836,7 +861,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
         const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
         if (evaluate_domain_name(mNetContext, host)) {
@@ -844,7 +869,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
         } else {
             rv = EAI_SYSTEM;
         }
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
     } else {
         // Note that this error code is currently not passed down to the client.
         // android_getaddrinfo_proxy() returns EAI_NODATA on any error.
@@ -911,22 +936,31 @@ DnsProxyListener::GetAddrInfoCmd::GetAddrInfoCmd() : FrameworkCommand("getaddrin
 int DnsProxyListener::GetAddrInfoCmd::runCommand(SocketClient* cli, int argc, char** argv) {
     logArguments(argc, argv);
 
+    int ai_flags = 0;
+    int ai_family = 0;
+    int ai_socktype = 0;
+    int ai_protocol = 0;
+    unsigned netId = 0;
+    std::string strErr = "GetAddrInfoCmd::runCommand: ";
+
     if (argc != 8) {
-        char* msg = nullptr;
-        asprintf(&msg, "Invalid number of arguments to getaddrinfo: %i", argc);
-        LOG(WARNING) << "GetAddrInfoCmd::runCommand: " << (msg ? msg : "null");
-        cli->sendMsg(ResponseCode::CommandParameterError, msg, false);
-        free(msg);
-        return -1;
+        strErr = strErr + "invalid number of arguments: " + std::to_string(argc);
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, 0, NULL);
     }
 
     const std::string name = argv[1];
     const std::string service = argv[2];
-    int ai_flags = strtol(argv[3], nullptr, 10);
-    int ai_family = strtol(argv[4], nullptr, 10);
-    int ai_socktype = strtol(argv[5], nullptr, 10);
-    int ai_protocol = strtol(argv[6], nullptr, 10);
-    unsigned netId = strtoul(argv[7], nullptr, 10);
+    if (!ParseInt(argv[3], &ai_flags))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
+    if (!ParseInt(argv[4], &ai_family))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
+    if (!ParseInt(argv[5], &ai_socktype))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
+    if (!ParseInt(argv[6], &ai_protocol))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
+    if (!ParseUint(argv[7], &netId))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
+
     const bool useLocalNameservers = checkAndClearUseLocalNameserversFlag(&netId);
     const uid_t uid = cli->getUid();
 
@@ -946,7 +980,7 @@ int DnsProxyListener::GetAddrInfoCmd::runCommand(SocketClient* cli, int argc, ch
         hints->ai_protocol = ai_protocol;
     }
 
-    (new GetAddrInfoHandler(cli, name, service, move(hints), netcontext))->spawn();
+    (new GetAddrInfoHandler(cli, name, service, std::move(hints), netcontext))->spawn();
     return 0;
 }
 
@@ -967,7 +1001,7 @@ int DnsProxyListener::ResNSendCommand::runCommand(SocketClient* cli, int argc, c
     }
 
     unsigned netId;
-    if (!simpleStrtoul(argv[1], &netId)) {
+    if (!ParseUint(argv[1], &netId)) {
         LOG(WARNING) << "ResNSendCommand::runCommand: resnsend: from UID " << uid
                      << ", invalid netId";
         sendBE32(cli, -EINVAL);
@@ -975,7 +1009,7 @@ int DnsProxyListener::ResNSendCommand::runCommand(SocketClient* cli, int argc, c
     }
 
     uint32_t flags;
-    if (!simpleStrtoul(argv[2], &flags)) {
+    if (!ParseUint(argv[2], &flags)) {
         LOG(WARNING) << "ResNSendCommand::runCommand: resnsend: from UID " << uid
                      << ", invalid flags";
         sendBE32(cli, -EINVAL);
@@ -1000,9 +1034,7 @@ DnsProxyListener::ResNSendHandler::ResNSendHandler(SocketClient* c, std::string 
     : Handler(c), mMsg(std::move(msg)), mFlags(flags), mNetContext(netcontext) {}
 
 void DnsProxyListener::ResNSendHandler::run() {
-    LOG(INFO) << "ResNSendHandler::run: " << mFlags << " / {" << mNetContext.app_netid << " "
-              << mNetContext.app_mark << " " << mNetContext.dns_netid << " " << mNetContext.dns_mark
-              << " " << mNetContext.uid << " " << mNetContext.flags << "}";
+    LOG(INFO) << "ResNSendHandler::run: " << mFlags << " / {" << mNetContext.toString() << "}";
 
     Stopwatch s;
     maybeFixupNetContext(&mNetContext, mClient->getPid());
@@ -1038,14 +1070,14 @@ void DnsProxyListener::ResNSendHandler::run() {
     int ansLen = -1;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         if (evaluate_domain_name(mNetContext, rr_name.c_str())) {
             ansLen = resolv_res_nsend(&mNetContext, {msg.data(), msgLen}, ansBuf, &rcode,
                                       static_cast<ResNsendFlags>(mFlags), &event);
         } else {
             ansLen = -EAI_SYSTEM;
         }
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
     } else {
         LOG(WARNING) << "ResNSendHandler::run: resnsend: from UID " << uid
                      << ", max concurrent queries reached";
@@ -1077,9 +1109,14 @@ void DnsProxyListener::ResNSendHandler::run() {
         return;
     }
 
-    // Restore query id and send answer
-    if (!setQueryId({ansBuf.data(), ansLen}, original_query_id) ||
-        !sendLenAndData(mClient, ansLen, ansBuf.data())) {
+    // Restore query id
+    if (!setQueryId({ansBuf.data(), ansLen}, original_query_id)) {
+        LOG(WARNING) << "ResNSendHandler::run: resnsend: failed to restore query id";
+        return;
+    }
+
+    // Send answer
+    if (!sendLenAndData(mClient, ansLen, ansBuf.data())) {
         PLOG(WARNING) << "ResNSendHandler::run: resnsend: failed to send answer to uid " << uid
                       << " pid " << mClient->getPid();
         return;
@@ -1124,7 +1161,7 @@ int DnsProxyListener::GetDnsNetIdCommand::runCommand(SocketClient* cli, int argc
     }
 
     unsigned netId;
-    if (!simpleStrtoul(argv[1], &netId)) {
+    if (!ParseUint(argv[1], &netId)) {
         LOG(WARNING) << "GetDnsNetIdCommand::runCommand: getdnsnetid: from UID " << uid
                      << ", invalid netId";
         sendCodeAndBe32(cli, ResponseCode::DnsProxyQueryResult, -EINVAL);
@@ -1158,20 +1195,22 @@ DnsProxyListener::GetHostByNameCmd::GetHostByNameCmd() : FrameworkCommand("getho
 int DnsProxyListener::GetHostByNameCmd::runCommand(SocketClient* cli, int argc, char** argv) {
     logArguments(argc, argv);
 
+    unsigned netId = 0;
+    int af = 0;
+    std::string strErr = "GetHostByNameCmd::runCommand: ";
+
     if (argc != 4) {
-        char* msg = nullptr;
-        asprintf(&msg, "Invalid number of arguments to gethostbyname: %i", argc);
-        LOG(WARNING) << "GetHostByNameCmd::runCommand: " << (msg ? msg : "null");
-        cli->sendMsg(ResponseCode::CommandParameterError, msg, false);
-        free(msg);
-        return -1;
+        strErr = strErr + "invalid number of arguments: " + std::to_string(argc);
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, 0, NULL);
     }
 
-    uid_t uid = cli->getUid();
-    unsigned netId = strtoul(argv[1], nullptr, 10);
-    const bool useLocalNameservers = checkAndClearUseLocalNameserversFlag(&netId);
+    if (!ParseUint(argv[1], &netId))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
     std::string name = argv[2];
-    int af = strtol(argv[3], nullptr, 10);
+    if (!ParseInt(argv[3], &af))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
+    uid_t uid = cli->getUid();
+    const bool useLocalNameservers = checkAndClearUseLocalNameserversFlag(&netId);
 
     android_net_context netcontext;
     gResNetdCallbacks.get_network_context(netId, uid, &netcontext);
@@ -1187,7 +1226,7 @@ int DnsProxyListener::GetHostByNameCmd::runCommand(SocketClient* cli, int argc, 
 DnsProxyListener::GetHostByNameHandler::GetHostByNameHandler(SocketClient* c, std::string name,
                                                              int af,
                                                              const android_net_context& netcontext)
-    : Handler(c), mName(move(name)), mAf(af), mNetContext(netcontext) {}
+    : Handler(c), mName(std::move(name)), mAf(af), mNetContext(netcontext) {}
 
 void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hostent* hbuf, char* buf,
                                                               size_t buflen, struct hostent** hpp,
@@ -1207,10 +1246,10 @@ void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hoste
 
     // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
     const uid_t uid = mClient->getUid();
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
         *rv = resolv_gethostbyname(name, AF_INET, hbuf, buf, buflen, &mNetContext, hpp, event);
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
         if (*rv) {
             *rv = EAI_NODATA;  // return original error code
             return;
@@ -1228,6 +1267,7 @@ void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hoste
 }
 
 void DnsProxyListener::GetHostByNameHandler::run() {
+    LOG(INFO) << "GetHostByNameHandler::run: {" << mNetContext.toString() << "}";
     Stopwatch s;
     maybeFixupNetContext(&mNetContext, mClient->getPid());
     const uid_t uid = mClient->getUid();
@@ -1237,7 +1277,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
         if (evaluate_domain_name(mNetContext, name)) {
             rv = resolv_gethostbyname(name, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext, &hp,
@@ -1245,7 +1285,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
         } else {
             rv = EAI_SYSTEM;
         }
-        queryLimiter.finish(uid);
+        endQueryLimiter(uid);
     } else {
         rv = EAI_MEMORY;
         LOG(ERROR) << "GetHostByNameHandler::run: from UID " << uid
@@ -1292,33 +1332,32 @@ DnsProxyListener::GetHostByAddrCmd::GetHostByAddrCmd() : FrameworkCommand("getho
 
 int DnsProxyListener::GetHostByAddrCmd::runCommand(SocketClient* cli, int argc, char** argv) {
     logArguments(argc, argv);
+    int addrLen = 0;
+    int addrFamily = 0;
+    unsigned netId = 0;
+    std::string strErr = "GetHostByAddrCmd::runCommand: ";
 
     if (argc != 5) {
-        char* msg = nullptr;
-        asprintf(&msg, "Invalid number of arguments to gethostbyaddr: %i", argc);
-        LOG(WARNING) << "GetHostByAddrCmd::runCommand: " << (msg ? msg : "null");
-        cli->sendMsg(ResponseCode::CommandParameterError, msg, false);
-        free(msg);
-        return -1;
+        strErr = strErr + "invalid number of arguments: " + std::to_string(argc);
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, 0, NULL);
     }
 
     char* addrStr = argv[1];
-    int addrLen = strtol(argv[2], nullptr, 10);
-    int addrFamily = strtol(argv[3], nullptr, 10);
+    if (!ParseInt(argv[2], &addrLen))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
+    if (!ParseInt(argv[3], &addrFamily))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
+    if (!ParseUint(argv[4], &netId))
+        return HandleArgumentError(cli, ResponseCode::CommandParameterError, strErr, argc, argv);
     uid_t uid = cli->getUid();
-    unsigned netId = strtoul(argv[4], nullptr, 10);
     const bool useLocalNameservers = checkAndClearUseLocalNameserversFlag(&netId);
 
     in6_addr addr;
     errno = 0;
     int result = inet_pton(addrFamily, addrStr, &addr);
     if (result <= 0) {
-        char* msg = nullptr;
-        asprintf(&msg, "inet_pton(\"%s\") failed %s", addrStr, strerror(errno));
-        LOG(WARNING) << "GetHostByAddrCmd::runCommand: " << (msg ? msg : "null");
-        cli->sendMsg(ResponseCode::OperationFailed, msg, false);
-        free(msg);
-        return -1;
+        strErr = strErr + "inet_pton(\"" + addrStr + "\") failed " + strerror(errno);
+        return HandleArgumentError(cli, ResponseCode::OperationFailed, strErr, 0, NULL);
     }
 
     android_net_context netcontext;
@@ -1369,20 +1408,23 @@ void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(hostent* hbuf,
     }
 
     const uid_t uid = mClient->getUid();
-    if (queryLimiter.start(uid)) {
+    if (startQueryLimiter(uid)) {
         // Remove NAT64 prefix and do reverse DNS query
         struct in_addr v4addr = {.s_addr = v6addr.s6_addr32[3]};
         resolv_gethostbyaddr(&v4addr, sizeof(v4addr), AF_INET, hbuf, buf, buflen, &mNetContext, hpp,
                              event);
-        queryLimiter.finish(uid);
-        if (*hpp) {
+        endQueryLimiter(uid);
+        if (*hpp && (*hpp)->h_addr_list[0]) {
             // Replace IPv4 address with original queried IPv6 address in place. The space has
             // reserved by dns_gethtbyaddr() and netbsd_gethostent_r() in
             // system/netd/resolv/gethnamaddr.cpp.
             // Note that resolv_gethostbyaddr() returns only one entry in result.
-            memcpy((*hpp)->h_addr_list[0], &v6addr, sizeof(v6addr));
+            char* addr = (*hpp)->h_addr_list[0];
+            memcpy(addr, &v6addr, sizeof(v6addr));
             (*hpp)->h_addrtype = AF_INET6;
             (*hpp)->h_length = sizeof(struct in6_addr);
+        } else {
+            LOG(ERROR) << __func__ << ": hpp or (*hpp)->h_addr_list[0] is null";
         }
     } else {
         LOG(ERROR) << __func__ << ": from UID " << uid << ", max concurrent queries reached";
@@ -1390,6 +1432,7 @@ void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(hostent* hbuf,
 }
 
 void DnsProxyListener::GetHostByAddrHandler::run() {
+    LOG(INFO) << "GetHostByAddrHandler::run: {" << mNetContext.toString() << "}";
     Stopwatch s;
     maybeFixupNetContext(&mNetContext, mClient->getPid());
     const uid_t uid = mClient->getUid();
@@ -1399,10 +1442,20 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (queryLimiter.start(uid)) {
-        rv = resolv_gethostbyaddr(&mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
-                                  sizeof tmpbuf, &mNetContext, &hp, &event);
-        queryLimiter.finish(uid);
+    if (startQueryLimiter(uid)) {
+        // From Android U, evaluate_domain_name() is not only for OEM customization, but also tells
+        // DNS resolver whether the UID can send DNS on the specified network. The function needs
+        // to be called even when there is no domain name to evaluate (GetHostByAddr). This is
+        // applied on U+ only so that the behavior won’t change on T- OEM devices.
+        // TODO: pass the actual name into evaluate_domain_name, e.g., 238.26.217.172.in-addr.arpa
+        //       when the lookup address is 172.217.26.238.
+        if (isAtLeastU() && !evaluate_domain_name(mNetContext, nullptr)) {
+            rv = EAI_SYSTEM;
+        } else {
+            rv = resolv_gethostbyaddr(&mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
+                                      sizeof tmpbuf, &mNetContext, &hp, &event);
+        }
+        endQueryLimiter(uid);
     } else {
         rv = EAI_MEMORY;
         LOG(ERROR) << "GetHostByAddrHandler::run: from UID " << uid

@@ -22,7 +22,7 @@
 
 #include <android-base/thread_annotations.h>
 
-#include "tests/doh/include/lib.rs.h"
+#include "doh/tests/doh_frontend/include/lib.rs.h"
 
 namespace test {
 
@@ -65,6 +65,7 @@ class DohFrontend {
 
     void clearQueries();
     bool block_sending(bool block);
+    bool setResetStreamId(uint64_t value);
     bool waitForAllClientsDisconnected() const;
 
     // To make the configuration effective, callers need to restart the DoH server after calling

@@ -16,9 +16,9 @@
 
 //! DoH server frontend.
 
-use crate::client::{ClientMap, ConnectionID, CONN_ID_LEN, DNS_HEADER_SIZE, MAX_UDP_PAYLOAD_SIZE};
-use crate::config::{Config, QUICHE_IDLE_TIMEOUT_MS};
-use crate::stats::Stats;
+use super::client::{ClientMap, ConnectionID, CONN_ID_LEN, DNS_HEADER_SIZE, MAX_UDP_PAYLOAD_SIZE};
+use super::config::{Config, QUICHE_IDLE_TIMEOUT_MS};
+use super::stats::Stats;
 use anyhow::{bail, ensure, Result};
 use lazy_static::lazy_static;
 use log::{debug, error, warn};
@@ -187,6 +187,11 @@ impl DohFrontend {
         Ok(())
     }
 
+    pub fn set_reset_stream_id(&self, value: u64) -> Result<()> {
+        self.config.lock().unwrap().reset_stream_id = Some(value);
+        Ok(())
+    }
+
     pub fn request_stats(&mut self) -> Result<Stats> {
         ensure!(
             self.command_tx.is_some(),
@@ -304,8 +309,8 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 }
             }
 
-            Ok((len, src)) = frontend_socket.recv_from(&mut frontend_buf) => {
-                debug!("Got {} bytes from {}", len, src);
+            Ok((len, peer)) = frontend_socket.recv_from(&mut frontend_buf) => {
+                debug!("Got {} bytes from {}", len, peer);
 
                 // Parse QUIC packet.
                 let pkt_buf = &mut frontend_buf[..len];
@@ -318,7 +323,8 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 };
                 debug!("Got QUIC packet: {:?}", hdr);
 
-                let client = match clients.get_or_create(&hdr, &src) {
+                let local = frontend_socket.local_addr()?;
+                let client = match clients.get_or_create(&hdr, &peer, &local) {
                     Ok(v) => v,
                     Err(e) => {
                         error!("Failed to get the client by the hdr {:?}: {}", hdr, e);
@@ -327,7 +333,7 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 };
                 debug!("Got client: {:?}", client);
 
-                match client.handle_frontend_message(pkt_buf) {
+                match client.handle_frontend_message(pkt_buf, &local) {
                     Ok(v) if !v.is_empty() => {
                         delay_queries_buffer.push(v);
                         queries_received += 1;
@@ -360,7 +366,8 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 let query_id = [backend_buf[0], backend_buf[1]];
                 for (_, client) in clients.iter_mut() {
                     if client.is_waiting_for_query(&query_id) {
-                        if let Err(e) = client.handle_backend_message(&backend_buf[..len]) {
+                        let reset_stream_id = config.lock().unwrap().reset_stream_id;
+                        if let Err(e) = client.handle_backend_message(&backend_buf[..len], reset_stream_id) {
                             error!("Failed to handle message from backend: {}", e);
                         }
                         let connection_id = client.connection_id().clone();

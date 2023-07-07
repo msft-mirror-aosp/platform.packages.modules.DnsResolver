@@ -17,11 +17,11 @@
 //! Client management, including the communication with quiche I/O.
 
 use anyhow::{anyhow, bail, ensure, Result};
+use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 use log::{debug, error, info, warn};
 use quiche::h3::NameValue;
 use std::collections::{hash_map, HashMap};
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::time::Duration;
 
 pub const DNS_HEADER_SIZE: usize = 12;
@@ -35,7 +35,7 @@ const URL_PATH_PREFIX: &str = "/dns-query?dns=";
 /// Manages a QUIC and HTTP/3 connection. No socket I/O operations.
 pub struct Client {
     /// QUIC connection.
-    conn: Pin<Box<quiche::Connection>>,
+    conn: quiche::Connection,
 
     /// HTTP/3 connection.
     h3_conn: Option<quiche::h3::Connection>,
@@ -59,7 +59,7 @@ pub struct Client {
 }
 
 impl Client {
-    fn new(conn: Pin<Box<quiche::Connection>>, addr: &SocketAddr, id: ConnectionID) -> Client {
+    fn new(conn: quiche::Connection, addr: &SocketAddr, id: ConnectionID) -> Client {
         Client {
             conn,
             h3_conn: None,
@@ -100,7 +100,7 @@ impl Client {
                         e.name() == b":path" && e.value().starts_with(URL_PATH_PREFIX.as_bytes())
                     }) {
                         let b64url_query = &target.value()[URL_PATH_PREFIX.len()..];
-                        let decoded = base64::decode_config(b64url_query, base64::URL_SAFE_NO_PAD)?;
+                        let decoded = BASE64_URL_SAFE_NO_PAD.decode(b64url_query)?;
                         self.in_flight_queries.insert([decoded[0], decoded[1]], stream_id);
                         ret = decoded;
                     }
@@ -127,7 +127,11 @@ impl Client {
     }
 
     // Converts the clear-text DNS response to a DoH response, and sends it to the quiche.
-    pub fn handle_backend_message(&mut self, response: &[u8]) -> Result<()> {
+    pub fn handle_backend_message(
+        &mut self,
+        response: &[u8],
+        send_reset_stream: Option<u64>,
+    ) -> Result<()> {
         ensure!(self.h3_conn.is_some(), "HTTP/3 connection not created");
         ensure!(response.len() >= DNS_HEADER_SIZE, "Insufficient bytes of DNS response");
 
@@ -145,6 +149,15 @@ impl Client {
             .in_flight_queries
             .remove(&[response[0], response[1]])
             .ok_or_else(|| anyhow!("query_id {:x} not found", query_id))?;
+
+        if let Some(send_reset_stream) = send_reset_stream {
+            if send_reset_stream == stream_id {
+                // Terminate the stream with an error code 99.
+                self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 99)?;
+                info!("Preparing RESET_STREAM on stream {}", stream_id);
+                return Ok(());
+            }
+        }
 
         info!("Preparing HTTP/3 response {:?} on stream {}", headers, stream_id);
 
@@ -189,8 +202,12 @@ impl Client {
 
     // Processes the packet received from the frontend socket. If |data| is a DoH query,
     // the function returns the wire format DNS query; otherwise, it returns empty vector.
-    pub fn handle_frontend_message(&mut self, data: &mut [u8]) -> Result<Vec<u8>> {
-        let recv_info = quiche::RecvInfo { from: self.addr };
+    pub fn handle_frontend_message(
+        &mut self,
+        data: &mut [u8],
+        local: &SocketAddr,
+    ) -> Result<Vec<u8>> {
+        let recv_info = quiche::RecvInfo { from: self.addr, to: *local };
         self.conn.recv(data, recv_info)?;
 
         if (self.conn.is_in_early_data() || self.conn.is_established()) && self.h3_conn.is_none() {
@@ -269,7 +286,8 @@ impl ClientMap {
     pub fn get_or_create(
         &mut self,
         hdr: &quiche::Header,
-        addr: &SocketAddr,
+        peer: &SocketAddr,
+        local: &SocketAddr,
     ) -> Result<&mut Client> {
         let conn_id = get_conn_id(hdr)?;
         let client = match self.clients.entry(conn_id.clone()) {
@@ -283,10 +301,11 @@ impl ClientMap {
                 let conn = quiche::accept(
                     &quiche::ConnectionId::from_ref(&conn_id),
                     None, /* odcid */
-                    *addr,
+                    *local,
+                    *peer,
                     &mut self.config,
                 )?;
-                let client = Client::new(conn, addr, conn_id.clone());
+                let client = Client::new(conn, peer, conn_id.clone());
                 info!("New client: {:?}", client);
                 vacant.insert(client)
             }

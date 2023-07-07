@@ -36,9 +36,10 @@ std::string ToString(const hostent* he) {
 std::string ToString(const addrinfo* ai) {
     if (!ai) return "<null>";
 
+    const sockaddr* ai_addr = ai->ai_addr;
     char host[NI_MAXHOST];
-    int rv = getnameinfo(ai->ai_addr, ai->ai_addrlen, host, sizeof(host), nullptr, 0,
-                         NI_NUMERICHOST);
+    const int rv =
+            getnameinfo(ai_addr, ai->ai_addrlen, host, sizeof(host), nullptr, 0, NI_NUMERICHOST);
     if (rv != 0) return gai_strerror(rv);
     return host;
 }
@@ -84,9 +85,10 @@ std::vector<std::string> ToStrings(const addrinfo* ai) {
         return hosts;
     }
     for (const auto* aip = ai; aip != nullptr; aip = aip->ai_next) {
+        const sockaddr* ai_addr = aip->ai_addr;
         char host[NI_MAXHOST];
-        int rv = getnameinfo(aip->ai_addr, aip->ai_addrlen, host, sizeof(host), nullptr, 0,
-                             NI_NUMERICHOST);
+        const int rv = getnameinfo(ai_addr, aip->ai_addrlen, host, sizeof(host), nullptr, 0,
+                                   NI_NUMERICHOST);
         if (rv != 0) {
             hosts.clear();
             hosts.push_back(gai_strerror(rv));
@@ -206,6 +208,12 @@ void SetMdnsRoute() {
             "proto",         "static", "scope", "host",  "src",         "127.0.0.1",
     };
     EXPECT_EQ(0, ForkAndRun(args));
+
+    const std::vector<std::string> args_v6 = {
+            "system/bin/ip", "-6", "route", "add",    "local", "ff02::fb",
+            "dev",           "lo", "proto", "static", "src",   "::1",
+    };
+    EXPECT_EQ(0, ForkAndRun(args_v6));
 }
 
 void RemoveMdnsRoute() {
@@ -214,4 +222,10 @@ void RemoveMdnsRoute() {
             "proto",         "static", "scope", "host",  "src",         "127.0.0.1",
     };
     EXPECT_EQ(0, ForkAndRun(args));
+
+    const std::vector<std::string> args_v6 = {
+            "system/bin/ip", "-6", "route", "del",    "local", "ff02::fb",
+            "dev",           "lo", "proto", "static", "src",   "::1",
+    };
+    EXPECT_EQ(0, ForkAndRun(args_v6));
 }
