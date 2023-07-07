@@ -140,7 +140,6 @@ constexpr char kDotPortString[] = "853";
 const std::string kFlagPrefix("persist.device_config.netd_native.");
 
 const std::string kDohEarlyDataFlag(kFlagPrefix + "doh_early_data");
-const std::string kDohFlag(kFlagPrefix + "doh");
 const std::string kDohIdleTimeoutFlag(kFlagPrefix + "doh_idle_timeout_ms");
 const std::string kDohProbeTimeoutFlag(kFlagPrefix + "doh_probe_timeout_ms");
 const std::string kDohQueryTimeoutFlag(kFlagPrefix + "doh_query_timeout_ms");
@@ -162,6 +161,10 @@ const std::string kRetryCountFlag(kFlagPrefix + "retry_count");
 const std::string kSkip4aQueryOnV6LinklocalAddrFlag(kFlagPrefix +
                                                     "skip_4a_query_on_v6_linklocal_addr");
 const std::string kSortNameserversFlag(kFlagPrefix + "sort_nameservers");
+
+const std::string kPersistNetPrefix("persist.net.");
+
+const std::string kQueryLogSize(kPersistNetPrefix + "dns_query_log_size");
 
 static constexpr char kLocalHost[] = "localhost";
 static constexpr char kLocalHostAddr[] = "127.0.0.1";
