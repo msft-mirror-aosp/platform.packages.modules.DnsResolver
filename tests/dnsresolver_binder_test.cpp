@@ -138,13 +138,14 @@ class DnsResolverBinderTest : public NetNativeTestBase {
                         if (!std::regex_match(line, match, lineRegex)) return false;
                         if (match.size() != 2) return false;
 
-                        // The binder_to_string format is changed from S that will add "(null)" to
-                        // the log on method's argument if binder object is null. But Q and R don't
-                        // have this format in log. So to make register null listener tests are
-                        // compatible from all version, just remove the "(null)" argument from
-                        // output logs if existed.
-                        const std::string output = android::base::StringReplace(
-                                match[1].str(), "(null)", "", /*all=*/true);
+                        // The binder_to_string format is changed over time to include more
+                        // information. To keep it working on Q/R/..., remove what has been
+                        // added for now. TODO(b/266248339)
+                        std::string output = match[1].str();
+                        using android::base::StringReplace;
+                        output = StringReplace(output, "(null)", "", /*all=*/true);
+                        output = StringReplace(output, "<unimplemented>", "", /*all=*/true);
+                        output = StringReplace(output, "<interface>", "", /*all=*/true);
                         return output == td.output;
                     });
             EXPECT_TRUE(found) << "Didn't find line '" << td.output << "' in dumpsys output.";
@@ -621,9 +622,9 @@ TEST_F(DnsResolverBinderTest, setLogSeverity) {
     EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_ERROR).isOk());
     mExpectedLogData.push_back({"setLogSeverity(4)", "setLogSeverity.*4"});
 
-    // Set back to default based off resolv_init(), the default is INFO for userdebug builds
+    // Set back to default based off resolv_init(), the default is INFO for userdebug/eng builds
     // and is WARNING for the other builds.
-    if (isUserDebugBuild()) {
+    if (isDebuggable()) {
         EXPECT_TRUE(mDnsResolver->setLogSeverity(IDnsResolver::DNS_RESOLVER_LOG_INFO).isOk());
         mExpectedLogData.push_back({"setLogSeverity(2)", "setLogSeverity.*2"});
     } else {

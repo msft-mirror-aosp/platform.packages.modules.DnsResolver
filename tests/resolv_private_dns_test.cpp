@@ -273,7 +273,6 @@ class BasePrivateDnsTest : public BaseTest {
 
   protected:
     void SetUp() override {
-        mDohScopedProp = std::make_unique<ScopedSystemProperties>(kDohFlag, "1");
         mDohQueryTimeoutScopedProp =
                 std::make_unique<ScopedSystemProperties>(kDohQueryTimeoutFlag, "1000");
         unsigned int expectedProbeTimeout = kExpectedDohValidationTimeWhenTimeout.count();
@@ -295,7 +294,6 @@ class BasePrivateDnsTest : public BaseTest {
 
     void TearDown() override {
         DumpResolverService();
-        mDohScopedProp.reset();
         BaseTest::TearDown();
     }
 
@@ -342,8 +340,7 @@ class BasePrivateDnsTest : public BaseTest {
     test::DNSResponder doh_backend{"127.0.1.3", kDnsPortString};
     test::DNSResponder dot_backend{"127.0.2.3", kDnsPortString};
 
-    // Used to enable DoH during the tests and set up a shorter timeout.
-    std::unique_ptr<ScopedSystemProperties> mDohScopedProp;
+    // Used to set up a shorter timeout.
     std::unique_ptr<ScopedSystemProperties> mDohQueryTimeoutScopedProp;
     std::unique_ptr<ScopedSystemProperties> mDohProbeTimeoutScopedProp;
 };
@@ -850,11 +847,7 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     ASSERT_TRUE(dot_ipv6.startServer());
     ASSERT_TRUE(doh_ipv6.startServer());
 
-    // It might already take several seconds before we are here. Add a ScopedSystemProperties
-    // to ensure the doh flag is 1 before creating a new network.
-    ScopedSystemProperties sp1(kDohFlag, "1");
     mDnsClient.SetupOemNetwork(TEST_NETID_2);
-
     parcel.netId = TEST_NETID_2;
     parcel.servers = {listen_ipv6_addr};
     parcel.tlsServers = {listen_ipv6_addr};
@@ -872,9 +865,6 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     // Expect two queries: one for DoH probe and the other one for kQueryHostname.
     EXPECT_EQ(doh_ipv6.queries(), 2);
 
-    // Add a ScopedSystemProperties here as well since DnsResolver will update its cached flags
-    // when the networks is removed.
-    ScopedSystemProperties sp2(kDohFlag, "1");
     mDnsClient.TearDownOemNetwork(TEST_NETID_2);
 
     // The DnsResolver will reconnect to the DoH server for the query that gets blocked at
@@ -1063,12 +1053,6 @@ TEST_F(PrivateDnsDohTest, SessionResumption) {
     for (const auto& flag : {"0", "1"}) {
         SCOPED_TRACE(fmt::format("flag: {}", flag));
         ScopedSystemProperties sp(kDohSessionResumptionFlag, flag);
-
-        // Each loop takes around 3 seconds, if the system property "doh" is reset in the middle
-        // of the first loop, this test will fail when running the second loop because DnsResolver
-        // updates its "doh" flag when resetNetwork() is called. Therefore, add another
-        // ScopedSystemProperties for "doh" to make the test more robust.
-        ScopedSystemProperties sp2(kDohFlag, "1");
         resetNetwork();
 
         ASSERT_TRUE(doh.stopServer());
@@ -1108,11 +1092,6 @@ TEST_F(PrivateDnsDohTest, TestEarlyDataFlag) {
         SCOPED_TRACE(fmt::format("flag: {}", flag));
         ScopedSystemProperties sp1(kDohSessionResumptionFlag, flag);
         ScopedSystemProperties sp2(kDohEarlyDataFlag, flag);
-
-        // As each loop takes around 2 seconds, it's possible the device_config flags are reset
-        // in the middle of the test. Add another ScopedSystemProperties for "doh" to make the
-        // test more robust.
-        ScopedSystemProperties sp3(kDohFlag, "1");
         resetNetwork();
 
         ASSERT_TRUE(doh.stopServer());
@@ -1163,4 +1142,36 @@ TEST_F(PrivateDnsDohTest, RemoteConnectionClosed) {
     EXPECT_NO_FAILURE(sendQueryAndCheckResult());
     EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
     EXPECT_EQ(doh.connections(), 1);
+}
+
+// Tests that a DNS query can quickly fall back from DoH to other dns protocols if server responds
+// the DNS query with RESET_STREAM, and that it doesn't influence subsequent DoH queries.
+TEST_F(PrivateDnsDohTest, ReceiveResetStream) {
+    const auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+    EXPECT_TRUE(WaitForDohValidation(test::kDefaultListenAddr, true));
+    EXPECT_TRUE(WaitForDotValidation(test::kDefaultListenAddr, true));
+    EXPECT_TRUE(dot.waitForQueries(1));
+    dot.clearQueries();
+    doh.clearQueries();
+    dns.clearQueries();
+
+    // DnsResolver uses bidirectional streams for DoH queries (See
+    // RFC9000#name-stream-types-and-identifier), and stream 0 has been used for DoH probe, so
+    // the next stream for the next DoH query will be 4.
+    EXPECT_TRUE(doh.setResetStreamId(4));
+
+    // Send a DNS request. The DoH query will be sent on stream 4 and fail.
+    Stopwatch s;
+    int fd = resNetworkQuery(TEST_NETID, kQueryHostname, ns_c_in, ns_t_aaaa,
+                             ANDROID_RESOLV_NO_CACHE_LOOKUP);
+    expectAnswersValid(fd, AF_INET6, kQueryAnswerAAAA);
+    EXPECT_LT(s.timeTakenUs() / 1000, 500);
+    EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 1 /* dot */, 1 /* doh */));
+
+    // Send another DNS request. The DoH query will be sent on stream 8 and succeed.
+    fd = resNetworkQuery(TEST_NETID, kQueryHostname, ns_c_in, ns_t_aaaa,
+                         ANDROID_RESOLV_NO_CACHE_LOOKUP);
+    expectAnswersValid(fd, AF_INET6, kQueryAnswerAAAA);
+    EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 1 /* dot */, 2 /* doh */));
 }

@@ -232,13 +232,24 @@ class PrivateDnsConfiguration {
         std::string host;
         std::string httpsTemplate;
         bool requireRootPermission;
-        base::Result<DohIdentity> getDohIdentity(const std::vector<std::string>& ips,
+
+        base::Result<DohIdentity> getDohIdentity(const std::vector<std::string>& sortedValidIps,
                                                  const std::string& host) const {
-            if (!host.empty() && this->host != host) return Errorf("host {} not matched", host);
-            for (const auto& ip : ips) {
-                if (this->ips.find(ip) == this->ips.end()) continue;
+            // If the private DNS hostname is known, `sortedValidIps` are the IP addresses
+            // resolved from the hostname, and hostname verification will be performed during
+            // TLS handshake to ensure the validity of the server, so it's not necessary to
+            // check the IP address.
+            if (!host.empty()) {
+                if (this->host != host) return Errorf("host {} not matched", host);
+                if (!sortedValidIps.empty()) {
+                    const auto& ip = sortedValidIps[0];
+                    LOG(INFO) << fmt::format("getDohIdentity: {} {}", ip, host);
+                    return DohIdentity{httpsTemplate, ip, host, Validation::in_process};
+                }
+            }
+            for (const auto& ip : sortedValidIps) {
+                if (ips.find(ip) == ips.end()) continue;
                 LOG(INFO) << fmt::format("getDohIdentity: {} {}", ip, host);
-                // Only pick the first one for now.
                 return DohIdentity{httpsTemplate, ip, host, Validation::in_process};
             }
             return Errorf("server not matched");
@@ -247,11 +258,16 @@ class PrivateDnsConfiguration {
 
     // TODO: Move below DoH relevant stuff into Rust implementation.
     std::map<unsigned, DohIdentity> mDohTracker GUARDED_BY(mPrivateDnsLock);
-    std::array<DohProviderEntry, 4> mAvailableDoHProviders = {{
+    std::array<DohProviderEntry, 5> mAvailableDoHProviders = {{
             {"Google",
              {"2001:4860:4860::8888", "2001:4860:4860::8844", "8.8.8.8", "8.8.4.4"},
              "dns.google",
              "https://dns.google/dns-query",
+             false},
+            {"Google DNS64",
+             {"2001:4860:4860::64", "2001:4860:4860::6464"},
+             "dns64.dns.google",
+             "https://dns64.dns.google/dns-query",
              false},
             {"Cloudflare",
              {"2606:4700::6810:f8f9", "2606:4700::6810:f9f9", "104.16.248.249", "104.16.249.249"},
@@ -273,6 +289,11 @@ class PrivateDnsConfiguration {
              "https://dns.androidtesting.org/dns-query",
              false},
     }};
+
+    // Makes a DohIdentity by looking up the `mAvailableDoHProviders` by `servers` and `name`.
+    base::Result<DohIdentity> makeDohIdentity(const std::vector<std::string>& servers,
+                                              const std::string& name) const
+            REQUIRES(mPrivateDnsLock);
 
     // For the metrics. Store the current DNS server list in the same order as what is passed
     // in setResolverConfiguration().
