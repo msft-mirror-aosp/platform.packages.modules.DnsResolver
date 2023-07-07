@@ -109,9 +109,9 @@ static int dns_gethtbyname(ResState* res, const char* name, int af, getnamaddr* 
         if (eom - (ptr) < (count)) goto no_recovery; \
     } while (0)
 
-static struct hostent* getanswer(const querybuf* _Nonnull answer, int anslen,
-                                 const char* _Nonnull qname, int qtype, struct hostent* hent,
-                                 char* buf, size_t buflen, int* he) {
+static struct hostent* getanswer(const querybuf* _Nonnull answer, int anslen, const char* qname,
+                                 int qtype, struct hostent* hent, char* buf, size_t buflen,
+                                 int* he) {
     const HEADER* hp;
     const uint8_t* cp;
     int n;
@@ -279,9 +279,11 @@ static struct hostent* getanswer(const querybuf* _Nonnull answer, int anslen,
                 }
                 break;
             case T_A:
-            case T_AAAA:
-                if (strcasecmp(hent->h_name, bp) != 0) {
-                    LOG(DEBUG) << __func__ << ": asked for \"" << hent->h_name << "\", got \"" << bp
+            case T_AAAA: {
+                if (hent->h_name == NULL) goto no_recovery;
+                const char* h_name = hent->h_name;
+                if (strcasecmp(h_name, bp) != 0) {
+                    LOG(DEBUG) << __func__ << ": asked for \"" << h_name << "\", got \"" << bp
                                << "\"";
                     cp += n;
                     continue; /* XXX - had_error++ ? */
@@ -325,6 +327,7 @@ static struct hostent* getanswer(const querybuf* _Nonnull answer, int anslen,
                 cp += n;
                 if (cp != erdata) goto no_recovery;
                 break;
+            }
             default:
                 abort();
         }
