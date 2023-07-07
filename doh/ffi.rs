@@ -19,6 +19,7 @@
 use crate::boot_time::{timeout, BootTime, Duration};
 use crate::dispatcher::{Command, Dispatcher, Response, ServerInfo};
 use crate::network::{SocketTagger, ValidationReporter};
+use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 use futures::FutureExt;
 use libc::{c_char, int32_t, size_t, ssize_t, uint32_t, uint64_t};
 use log::{error, warn};
@@ -190,6 +191,8 @@ pub unsafe extern "C" fn doh_net_new(
     sk_mark: libc::uint32_t,
     cert_path: *const c_char,
     flags: &FeatureFlags,
+    network_type: uint32_t,
+    private_dns_mode: uint32_t,
 ) -> int32_t {
     let (url, domain, ip_addr, cert_path) = match (
         std::ffi::CStr::from_ptr(url).to_str(),
@@ -235,6 +238,8 @@ pub unsafe extern "C" fn doh_net_new(
             idle_timeout_ms: flags.idle_timeout_ms,
             use_session_resumption: flags.use_session_resumption,
             enable_early_data: flags.enable_early_data,
+            network_type,
+            private_dns_mode,
         },
         timeout: Duration::from_millis(flags.probe_timeout_ms),
     };
@@ -270,7 +275,7 @@ pub unsafe extern "C" fn doh_query(
     if let Some(expired_time) = BootTime::now().checked_add(t) {
         let cmd = Command::Query {
             net_id,
-            base64_query: base64::encode_config(q, base64::URL_SAFE_NO_PAD),
+            base64_query: BASE64_URL_SAFE_NO_PAD.encode(q),
             expired_time,
             resp: resp_tx,
         };
@@ -387,6 +392,8 @@ mod tests {
             idle_timeout_ms: 0,
             use_session_resumption: true,
             enable_early_data: true,
+            network_type: 2,
+            private_dns_mode: 3,
         };
 
         wrap_validation_callback(success_cb)(&info, true).await;

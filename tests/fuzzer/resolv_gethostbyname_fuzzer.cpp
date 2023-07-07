@@ -1,3 +1,8 @@
+#include <netdb.h>
+#include <sys/param.h>
+
+#include <string>
+
 #include "resolv_fuzzer_utils.h"
 
 namespace android::net {
@@ -21,13 +26,8 @@ void TestResolvGethostbyname(FuzzedDataProvider& fdp) {
 
 // Entry point of fuzzing test.
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    [[maybe_unused]] static bool initialized = DoInit();
+    [[maybe_unused]] static const bool initialized = DoInit();
     FuzzedDataProvider fdp(data, size);
-
-    // Chooses doh or dot.
-    std::string flag = fdp.PickValueInArray({"0", "1"});
-    ScopedSystemProperties sp(kDohFlag, flag);
-    android::net::Experiments::getInstance()->update();
 
     auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
     // Chooses private DNS or not.
