@@ -196,12 +196,11 @@ fn create_quiche_config() {
 #[test]
 fn shared_cache() {
     let cache_a = Cache::new();
-    let cache_b = cache_a.clone();
     let config_a = cache_a
         .get(&Key { cert_path: None, max_idle_timeout: 1000, enable_early_data: true })
         .unwrap();
     assert_eq!(Arc::strong_count(&config_a.0), 2);
-    let _config_b = cache_b
+    let _config_b = cache_a
         .get(&Key { cert_path: None, max_idle_timeout: 1000, enable_early_data: true })
         .unwrap();
     assert_eq!(Arc::strong_count(&config_a.0), 3);
@@ -292,7 +291,9 @@ async fn quiche_connect() {
     let mut config =
         Config::from_key(&Key { cert_path: None, max_idle_timeout: 10, enable_early_data: true })
             .unwrap();
-    let socket_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 42));
+    let local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 42));
+    let peer = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 41));
     let conn_id = quiche::ConnectionId::from_ref(&[]);
-    quiche::connect(None, &conn_id, socket_addr, config.take().await.deref_mut()).unwrap();
+
+    quiche::connect(None, &conn_id, local, peer, config.take().await.deref_mut()).unwrap();
 }
