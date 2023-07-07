@@ -102,6 +102,7 @@ cc_test {
     ],
     shared_libs: [
         "libbinder_ndk",
+        "libstatssocket",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
@@ -219,6 +220,12 @@ cc_test {
             suffix: "64",
         },
     },
+    // 'resolv_integration_test' used DisableConfigSyncTargetPreparer provided
+    // by net-tests-utils-host-common; adding it to make the host jar available
+    // after the build process.
+    host_required: [
+        "net-tests-utils-host-common",
+    ]
 }
 
 cc_test {
@@ -245,6 +252,7 @@ cc_test {
     ],
     shared_libs: [
         "libbinder_ndk",
+        "libstatssocket",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
@@ -314,7 +322,7 @@ cc_test {
         "connectivity-mainline-presubmit-cc-defaults",
         "netd_defaults",
         "resolv_test_defaults",
-        "resolv_test_mts_coverage_defaults",
+        "resolv_test_mts_coverage_without_root_defaults",
     ],
     header_libs: [
         "libnetd_resolv_internal_headers",
@@ -326,9 +334,11 @@ cc_test {
         "libgmock",
         "libnetdutils",
         "libssl",
+        "stats_proto",
     ],
     shared_libs: [
         "libnetd_client",
+        "libstatssocket",
     ],
 }
 
@@ -340,6 +350,7 @@ cc_defaults {
     ],
     srcs: [
         "doh_frontend.cpp",
+        "fuzzer/resolv_fuzzer_utils.cpp",
     ],
     header_libs: [
         "libnetd_resolv_headers",
@@ -347,6 +358,7 @@ cc_defaults {
     ],
     shared_libs: [
         "libbinder_ndk",
+        "libstatssocket",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
@@ -370,6 +382,7 @@ cc_defaults {
             "cken@google.com",
             "kfcchen@google.com",
        ],
+        componentid: 31808,  // Android > Android OS & Apps > Systems > core networking
     },
 }
 
@@ -389,4 +402,46 @@ cc_fuzz {
     name: "resolv_getaddrinfo_fuzzer",
     defaults: ["resolv_fuzzer_defaults"],
     srcs: ["fuzzer/resolv_getaddrinfo_fuzzer.cpp"],
+}
+
+cc_fuzz {
+    name: "resolv_service_fuzzer",
+    defaults: [
+        "resolv_fuzzer_defaults",
+    ],
+    static_libs: [
+        "libstatslog_resolv",
+        "libstatspush_compat",
+        "libbase",
+        "libbinder_random_parcel",
+        "libcutils",
+    ],
+    target: {
+        android: {
+            shared_libs: [
+                "libbinder_ndk",
+                "libbinder",
+                "libutils",
+            ],
+        },
+        host: {
+            static_libs: [
+                "libbinder_ndk",
+                "libbinder",
+                "libutils",
+            ],
+        },
+        darwin: {
+            enabled: false,
+        },
+    },
+    fuzz_config: {
+        cc: [
+            "smoreland@google.com",
+            "waghpawan@google.com",
+        ],
+        // Adds bugs to hotlist "AIDL fuzzer bugs" on buganizer
+        hotlists: ["4637097"],
+    },
+    srcs: ["fuzzer/resolv_service_fuzzer.cpp"],
 }

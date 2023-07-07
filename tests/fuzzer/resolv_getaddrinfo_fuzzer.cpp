@@ -1,3 +1,8 @@
+#include <netdb.h>
+#include <sys/param.h>
+
+#include <string>
+
 #include "resolv_fuzzer_utils.h"
 
 namespace android::net {
@@ -16,13 +21,14 @@ void TestResolvGetaddrinfo(FuzzedDataProvider& fdp) {
 
     resolv_getaddrinfo(hostname.c_str(), fdp.ConsumeBool() ? servname.c_str() : nullptr,
                        fdp.ConsumeBool() ? &hints : nullptr, &mNetContext, &result, &event);
+    netdutils::ScopedAddrinfo result_cleanup(result);
 }
 
 }  // namespace
 
 // Entry point of fuzzing test.
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    [[maybe_unused]] static bool initialized = DoInit();
+    [[maybe_unused]] static const bool initialized = DoInit();
     // Sets delayQueries to let DnsTlsFrontend handle 2 queries at once.
     // If the Address Family is AF_UNSPEC, the frontend will receive both ipv4 and ipv6 queries.
     // Without setting delayQueries, the second query's connection between the dns_tls_frontend and
@@ -32,11 +38,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     dot.setDelayQueries(2);
     dot.setDelayQueriesTimeout(1000);
     FuzzedDataProvider fdp(data, size);
-
-    // Chooses doh or dot.
-    std::string flag = fdp.PickValueInArray({"0", "1"});
-    ScopedSystemProperties sp(kDohFlag, flag);
-    android::net::Experiments::getInstance()->update();
 
     auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
     // Chooses private DNS or not.

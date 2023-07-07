@@ -67,6 +67,7 @@
 
 #define ANY 0
 
+using android::net::Experiments;
 using android::net::NetworkDnsEventReported;
 
 const char in_addrany[] = {0, 0, 0, 0};
@@ -150,7 +151,6 @@ static bool files_getaddrinfo(const size_t netid, const char* name, const addrin
 static int _find_src_addr(const struct sockaddr*, struct sockaddr*, unsigned, uid_t,
                           bool allow_v6_linklocal);
 
-static int res_queryN(const char* name, res_target* target, ResState* res, int* herrno);
 static int res_searchN(const char* name, res_target* target, ResState* res, int* herrno);
 static int res_querydomainN(const char* name, const char* domain, res_target* target, ResState* res,
                             int* herrno);
@@ -672,13 +672,11 @@ static struct addrinfo* get_ai(const struct addrinfo* pai, const struct afd* afd
     assert(afd != NULL);
     assert(addr != NULL);
 
-    ai = (struct addrinfo*) malloc(sizeof(struct addrinfo) + sizeof(sockaddr_union));
+    ai = (struct addrinfo*) calloc(1, sizeof(struct addrinfo) + sizeof(sockaddr_union));
     if (ai == NULL) return NULL;
 
     memcpy(ai, pai, sizeof(struct addrinfo));
     ai->ai_addr = (struct sockaddr*) (void*) (ai + 1);
-    memset(ai->ai_addr, 0, sizeof(sockaddr_union));
-
     ai->ai_addrlen = afd->a_socklen;
     ai->ai_addr->sa_family = ai->ai_family = afd->a_af;
     p = (char*) (void*) (ai->ai_addr);
@@ -1312,9 +1310,17 @@ static int _find_src_addr(const struct sockaddr* addr, struct sockaddr* src_addr
         return -1;
     }
 
-    if (src_addr->sa_family == AF_INET6) {
+    if (Experiments::getInstance()->getFlag("skip_4a_query_on_v6_linklocal_addr", 1) &&
+        src_addr->sa_family == AF_INET6) {
         sockaddr_in6* sin6 = reinterpret_cast<sockaddr_in6*>(src_addr);
         if (!allow_v6_linklocal && IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
+            // There is no point in sending an AAAA query because the device does not have a global
+            // IP address. The only thing that can be affected is the hostname "localhost". Devices
+            // with this setting will not be able to get the localhost v6 IP address ::1 via DNS
+            // lookups, which is accessible by host local. But it is expected that a DNS server that
+            // replies to "localhost" in AAAA should also reply in A. So it shouldn't cause issues.
+            // Also, the current behavior will not be changed because hostname “localhost” only gets
+            // 127.0.0.1 per etc/hosts configs.
             return 0;
         }
     }
@@ -1340,7 +1346,7 @@ void resolv_rfc6724_sort(struct addrinfo* list_sentinel, unsigned mark, uid_t ui
         cur = cur->ai_next;
     }
 
-    elems = (struct addrinfo_sort_elem*) malloc(nelem * sizeof(struct addrinfo_sort_elem));
+    elems = (struct addrinfo_sort_elem*) calloc(nelem, sizeof(struct addrinfo_sort_elem));
     if (elems == NULL) {
         goto error;
     }
@@ -1594,6 +1600,8 @@ struct QueryResult {
     NetworkDnsEventReported event;
 };
 
+// Formulate a normal query, send, and await answer.
+// Caller must parse answer and determine whether it answers the question.
 QueryResult doQuery(const char* name, res_target* t, ResState* res,
                     std::chrono::milliseconds sleepTimeMs) {
     HEADER* hp = (HEADER*)(void*)t->answer.data();
@@ -1631,7 +1639,6 @@ QueryResult doQuery(const char* name, res_target* t, ResState* res,
     int rcode = NOERROR;
     n = res_nsend(&res_temp, {buf, n}, {t->answer.data(), anslen}, &rcode, 0, sleepTimeMs);
     if (n < 0 || hp->rcode != NOERROR || ntohs(hp->ancount) == 0) {
-        // To ensure that the rcode handling is identical to res_queryN().
         if (rcode != RCODE_TIMEOUT) rcode = hp->rcode;
         // if the query choked with EDNS0, retry without EDNS0
         if ((res_temp.netcontext_flags &
@@ -1657,6 +1664,8 @@ QueryResult doQuery(const char* name, res_target* t, ResState* res,
 
 }  // namespace
 
+// This function runs doQuery() for each res_target in parallel.
+// The `target`, which is set in dns_getaddrinfo(), contains at most two res_target.
 static int res_queryN_parallel(const char* name, res_target* target, ResState* res, int* herrno) {
     std::vector<std::future<QueryResult>> results;
     results.reserve(2);
@@ -1666,8 +1675,8 @@ static int res_queryN_parallel(const char* name, res_target* target, ResState* r
         // Avoiding gateways drop packets if queries are sent too close together
         // Only needed if we have multiple queries in a row.
         if (t->next) {
-            int sleepFlag = android::net::Experiments::getInstance()->getFlag(
-                    "parallel_lookup_sleep_time", SLEEP_TIME_MS);
+            int sleepFlag = Experiments::getInstance()->getFlag("parallel_lookup_sleep_time",
+                                                                SLEEP_TIME_MS);
             if (sleepFlag > 1000) sleepFlag = 1000;
             sleepTimeMs = std::chrono::milliseconds(sleepFlag);
         }
@@ -1693,92 +1702,6 @@ static int res_queryN_parallel(const char* name, res_target* target, ResState* r
         return -1;
     }
 
-    return ancount;
-}
-
-static int res_queryN_wrapper(const char* name, res_target* target, ResState* res, int* herrno) {
-    const bool parallel_lookup =
-            android::net::Experiments::getInstance()->getFlag("parallel_lookup_release", 1);
-    if (parallel_lookup) return res_queryN_parallel(name, target, res, herrno);
-
-    return res_queryN(name, target, res, herrno);
-}
-
-/*
- * Formulate a normal query, send, and await answer.
- * Returned answer is placed in supplied buffer "answer".
- * Perform preliminary check of answer, returning success only
- * if no error is indicated and the answer count is nonzero.
- * Return the size of the response on success, -1 on error.
- * Error number is left in *herrno.
- *
- * Caller must parse answer and determine whether it answers the question.
- */
-static int res_queryN(const char* name, res_target* target, ResState* res, int* herrno) {
-    uint8_t buf[MAXPACKET];
-    int n;
-    struct res_target* t;
-    int rcode;
-    int ancount;
-
-    assert(name != NULL);
-    /* XXX: target may be NULL??? */
-
-    rcode = NOERROR;
-    ancount = 0;
-
-    for (t = target; t; t = t->next) {
-        HEADER* hp = (HEADER*)(void*)t->answer.data();
-        bool retried = false;
-    again:
-        hp->rcode = NOERROR; /* default */
-
-        /* make it easier... */
-        int cl = t->qclass;
-        int type = t->qtype;
-        const int anslen = t->answer.size();
-
-        LOG(DEBUG) << __func__ << ": (" << cl << ", " << type << ")";
-        n = res_nmkquery(QUERY, name, cl, type, {}, buf, res->netcontext_flags);
-        if (n > 0 &&
-            (res->netcontext_flags &
-             (NET_CONTEXT_FLAG_USE_DNS_OVER_TLS | NET_CONTEXT_FLAG_USE_EDNS)) &&
-            !retried)  // TODO:  remove the retry flag and provide a sufficient test coverage.
-            n = res_nopt(res, n, buf, anslen);
-        if (n <= 0) {
-            LOG(ERROR) << __func__ << ": res_nmkquery failed";
-            *herrno = NO_RECOVERY;
-            return n;
-        }
-
-        n = res_nsend(res, {buf, n}, {t->answer.data(), anslen}, &rcode, 0);
-        if (n < 0 || hp->rcode != NOERROR || ntohs(hp->ancount) == 0) {
-            // Record rcode from DNS response header only if no timeout.
-            // Keep rcode timeout for reporting later if any.
-            if (rcode != RCODE_TIMEOUT) rcode = hp->rcode;  // record most recent error
-            // if the query choked with EDNS0, retry without EDNS0 that when the server
-            // has no response, resovler won't retry and do nothing. Even fallback to UDP,
-            // we also has the same symptom if EDNS is enabled.
-            if ((res->netcontext_flags &
-                 (NET_CONTEXT_FLAG_USE_DNS_OVER_TLS | NET_CONTEXT_FLAG_USE_EDNS)) &&
-                (res->flags & RES_F_EDNS0ERR) && !retried) {
-                LOG(DEBUG) << __func__ << ": retry without EDNS0";
-                retried = true;
-                goto again;
-            }
-            LOG(INFO) << __func__ << ": rcode=" << rcode << ", ancount=" << ntohs(hp->ancount);
-            continue;
-        }
-
-        ancount += ntohs(hp->ancount);
-
-        t->n = n;
-    }
-
-    if (ancount == 0) {
-        *herrno = getHerrnoFromRcode(rcode);
-        return -1;
-    }
     return ancount;
 }
 
@@ -1928,5 +1851,5 @@ static int res_querydomainN(const char* name, const char* domain, res_target* ta
         }
         snprintf(nbuf, sizeof(nbuf), "%s.%s", name, domain);
     }
-    return res_queryN_wrapper(longname, target, res, herrno);
+    return res_queryN_parallel(longname, target, res, herrno);
 }
