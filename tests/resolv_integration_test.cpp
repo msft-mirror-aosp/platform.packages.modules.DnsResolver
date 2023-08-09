@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <iterator>
 #include <numeric>
 #include <string_view>
@@ -4098,54 +4099,46 @@ TEST_F(ResolverTest, GetHostByName2_Dns64QuerySpecialUseIPv4Addresses) {
 
 TEST_F(ResolverTest, PrefixDiscoveryBypassTls) {
     constexpr char listen_addr[] = "::1";
-    constexpr char cleartext_port[] = "53";
-    constexpr char tls_port[] = "853";
     constexpr char dns64_name[] = "ipv4only.arpa.";
     const std::vector<std::string> servers = {listen_addr};
 
     test::DNSResponder dns(listen_addr);
     StartDns(dns, {{dns64_name, ns_type::ns_t_aaaa, "64:ff9b::192.0.0.170"}});
-    test::DnsTlsFrontend tls(listen_addr, tls_port, listen_addr, cleartext_port);
+    test::DnsTlsFrontend tls(listen_addr, "853", listen_addr, "53");
     ASSERT_TRUE(tls.startServer());
 
-    // Setup OPPORTUNISTIC mode and wait for the validation complete.
-    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(
-            ResolverParams::Builder().setDnsServers(servers).setDotServers(servers).build()));
-    EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
-    EXPECT_TRUE(tls.waitForQueries(1));
-    tls.clearQueries();
+    for (const std::string_view dnsMode : {"OPPORTUNISTIC", "STRICT"}) {
+        SCOPED_TRACE(fmt::format("testConfig: [{}]", dnsMode));
+        auto builder = ResolverParams::Builder().setDnsServers(servers).setDotServers(servers);
+        if (dnsMode == "STRICT") {
+            builder.setPrivateDnsProvider(kDefaultPrivateDnsHostName);
+        }
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(builder.build()));
+        EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
+        EXPECT_TRUE(tls.waitForQueries(1));
+        tls.clearQueries();
 
-    // Start NAT64 prefix discovery and wait for it complete.
-    EXPECT_TRUE(mDnsClient.resolvService()->startPrefix64Discovery(TEST_NETID).isOk());
-    EXPECT_TRUE(WaitForNat64Prefix(EXPECT_FOUND));
+        // Start NAT64 prefix discovery.
+        EXPECT_TRUE(mDnsClient.resolvService()->startPrefix64Discovery(TEST_NETID).isOk());
+        EXPECT_TRUE(WaitForNat64Prefix(EXPECT_FOUND));
 
-    // Verify it bypassed TLS even though there's a TLS server available.
-    EXPECT_EQ(0, tls.queries()) << dns.dumpQueries();
-    EXPECT_EQ(1U, GetNumQueries(dns, dns64_name)) << dns.dumpQueries();
+        // Verify that the DNS query for the NAT64 prefix bypassed private DNS.
+        EXPECT_EQ(0, tls.queries()) << dns.dumpQueries();
+        EXPECT_EQ(1U, GetNumQueries(dns, dns64_name)) << dns.dumpQueries();
 
-    // Restart the testing network to reset the cache.
-    mDnsClient.TearDown();
-    mDnsClient.SetUp();
-    dns.clearQueries();
+        // Stop the prefix discovery to make DnsResolver send the prefix-removed event
+        // earlier. Without this, DnsResolver still sends the event once the network
+        // is destroyed; however, it will fail the next test if the test unexpectedly
+        // receives the event that it doesn't want.
+        EXPECT_TRUE(mDnsClient.resolvService()->stopPrefix64Discovery(TEST_NETID).isOk());
+        EXPECT_TRUE(WaitForNat64Prefix(EXPECT_NOT_FOUND));
 
-    // Setup STRICT mode and wait for the validation complete.
-    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(
-            ResolverParams::Builder()
-                    .setDnsServers(servers)
-                    .setDotServers(servers)
-                    .setPrivateDnsProvider(kDefaultPrivateDnsHostName)
-                    .build()));
-    EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
-    EXPECT_TRUE(tls.waitForQueries(1));
-    tls.clearQueries();
+        dns.clearQueries();
+        EXPECT_TRUE(mDnsClient.resolvService()->flushNetworkCache(TEST_NETID).isOk());
+    }
 
-    // Start NAT64 prefix discovery and wait for it to complete.
-    EXPECT_TRUE(mDnsClient.resolvService()->startPrefix64Discovery(TEST_NETID).isOk());
-    EXPECT_TRUE(WaitForNat64Prefix(EXPECT_FOUND));
-
-    // Verify it bypassed TLS despite STRICT mode.
-    EXPECT_EQ(0, tls.queries()) << dns.dumpQueries();
-    EXPECT_EQ(1U, GetNumQueries(dns, dns64_name)) << dns.dumpQueries();
+    EXPECT_EQ(0, sDnsMetricsListener->getUnexpectedNat64PrefixUpdates());
+    EXPECT_EQ(0, sUnsolicitedEventListener->getUnexpectedNat64PrefixUpdates());
 }
 
 TEST_F(ResolverTest, SetAndClearNat64Prefix) {
@@ -5635,12 +5628,11 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
     parcel.tlsServers = {addr1, addr2, unusable_addr};
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
 
-    // Check the validation results.
+    // Check the validation status before proceed. The validation for `unresponsiveTls`
+    // should be running, and the other two should be finished.
     EXPECT_TRUE(WaitForPrivateDnsValidation(workableTls.listen_address(), true));
     EXPECT_TRUE(WaitForPrivateDnsValidation(unusable_addr, false));
-
-    // The validation is still in progress.
-    EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 1);
+    EXPECT_TRUE(PollForCondition([&]() { return unresponsiveTls.acceptConnectionsCount() == 1; }));
     unresponsiveTls.clearConnectionsCount();
 
     static const struct TestConfig {
@@ -5716,7 +5708,8 @@ TEST_F(ResolverTest, RepeatedSetup_NoRedundantPrivateDnsValidation) {
         }
 
         if (validationAttemptToUnresponsiveTls) {
-            EXPECT_GT(unresponsiveTls.acceptConnectionsCount(), 0);
+            EXPECT_TRUE(PollForCondition(
+                    [&]() { return unresponsiveTls.acceptConnectionsCount() > 0; }));
         } else {
             EXPECT_EQ(unresponsiveTls.acceptConnectionsCount(), 0);
         }
