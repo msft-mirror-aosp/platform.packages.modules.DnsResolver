@@ -20,12 +20,14 @@
 #include <netinet/in.h>
 #include <condition_variable>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 
 #include <android-base/thread_annotations.h>
 #include <netdutils/DumpWriter.h>
 #include <netdutils/InternetAddresses.h>
+#include <utils/RefBase.h>
 
 struct android_net_context;
 
@@ -47,7 +49,7 @@ namespace net {
  * Thread-safety: All public methods in this class MUST be thread-safe.
  * (In other words: this class handles all its locking privately.)
  */
-class Dns64Configuration {
+class Dns64Configuration : virtual public RefBase {
   public:
     // Simple data struct for passing back packet NAT64 prefix event information to the
     // Dns64PrefixCallback callback.
