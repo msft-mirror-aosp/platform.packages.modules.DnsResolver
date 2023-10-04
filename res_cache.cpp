@@ -154,7 +154,7 @@ using std::span;
  * *****************************************
  */
 const int MAX_ENTRIES_DEFAULT = 64 * 2 * 5;
-const int MAX_ENTRIES_LOWER_BOUND = 0;
+const int MAX_ENTRIES_LOWER_BOUND = 1;
 const int MAX_ENTRIES_UPPER_BOUND = 100 * 1000;
 constexpr int DNSEVENT_SUBSAMPLING_MAP_DEFAULT_KEY = -1;
 
@@ -1214,7 +1214,7 @@ static void _cache_remove_oldest(Cache* cache) {
         return;
     }
     LOG(DEBUG) << __func__ << ": Cache full - removing oldest";
-    res_pquery({oldest->query, oldest->querylen});
+    res_pquery(std::span(oldest->query, oldest->querylen));
     _cache_remove_p(cache, lookup);
 }
 
@@ -1318,13 +1318,13 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
     /* remove stale entries here */
     if (now >= e->expires) {
         LOG(DEBUG) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
-        res_pquery({e->query, e->querylen});
+        res_pquery(std::span(e->query, e->querylen));
         _cache_remove_p(cache, lookup);
         return RESOLV_CACHE_NOTFOUND;
     }
 
     *answerlen = e->answerlen;
-    if (e->answerlen > answer.size()) {
+    if (e->answerlen > static_cast<ptrdiff_t>(answer.size())) {
         /* NOTE: we return UNSUPPORTED if the answer buffer is too short */
         LOG(INFO) << __func__ << ": ANSWER TOO LONG";
         return RESOLV_CACHE_UNSUPPORTED;
@@ -2101,4 +2101,12 @@ int resolv_get_max_cache_entries(unsigned netid) {
         return -1;
     }
     return info->cache->get_max_cache_entries();
+}
+
+bool resolv_is_enforceDnsUid_enabled_network(unsigned netid) {
+    std::lock_guard guard(cache_mutex);
+    if (const auto info = find_netconfig_locked(netid); info != nullptr) {
+        return info->enforceDnsUid;
+    }
+    return false;
 }
