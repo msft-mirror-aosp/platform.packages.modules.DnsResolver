@@ -70,20 +70,19 @@ using std::span;
 
 namespace android {
 
+using netdutils::MAX_QUERIES_IN_TOTAL;
+using netdutils::MAX_QUERIES_PER_UID;
 using netdutils::ResponseCode;
 using netdutils::Stopwatch;
 
 namespace net {
 namespace {
 
-// Limits the number of outstanding DNS queries by client UID.
-constexpr int MAX_QUERIES_PER_UID = 256;
-
 android::netdutils::OperationLimiter<uid_t> queryLimiter(MAX_QUERIES_PER_UID);
 
 bool startQueryLimiter(uid_t uid) {
-    const int globalLimit =
-            android::net::Experiments::getInstance()->getFlag("max_queries_global", INT_MAX);
+    const int globalLimit = android::net::Experiments::getInstance()->getFlag("max_queries_global",
+                                                                              MAX_QUERIES_IN_TOTAL);
     return queryLimiter.start(uid, globalLimit);
 }
 
@@ -819,21 +818,14 @@ void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinf
 
     if (ipv6WantedButNoData) {
         // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
-        const uid_t uid = mClient->getUid();
-        if (startQueryLimiter(uid)) {
-            const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
-            const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
-            mHints->ai_family = AF_INET;
-            // Don't need to do freeaddrinfo(res) before starting new DNS lookup because previous
-            // DNS lookup is failed with error EAI_NODATA.
-            *rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, res, event);
-            endQueryLimiter(uid);
-            if (*rv) {
-                *rv = EAI_NODATA;  // return original error code
-                return;
-            }
-        } else {
-            LOG(ERROR) << __func__ << ": from UID " << uid << ", max concurrent queries reached";
+        const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
+        const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
+        mHints->ai_family = AF_INET;
+        // Don't need to do freeaddrinfo(res) before starting new DNS lookup because previous
+        // DNS lookup is failed with error EAI_NODATA.
+        *rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, res, event);
+        if (*rv) {
+            *rv = EAI_NODATA;  // return original error code
             return;
         }
     }
@@ -866,6 +858,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
         const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
         if (evaluate_domain_name(mNetContext, host)) {
             rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, &result, &event);
+            doDns64Synthesis(&rv, &result, &event);
         } else {
             rv = EAI_SYSTEM;
         }
@@ -878,7 +871,6 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64Synthesis(&rv, &result, &event);
     const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
     event.set_latency_micros(latencyUs);
     event.set_event_type(EVENT_GETADDRINFO);
@@ -1056,8 +1048,8 @@ void DnsProxyListener::ResNSendHandler::run() {
     uint16_t original_query_id = 0;
 
     // TODO: Handle the case which is msg contains more than one query
-    if (!parseQuery({msg.data(), msgLen}, &original_query_id, &rr_type, &rr_name) ||
-        !setQueryId({msg.data(), msgLen}, arc4random_uniform(65536))) {
+    if (!parseQuery(std::span(msg.data(), msgLen), &original_query_id, &rr_type, &rr_name) ||
+        !setQueryId(std::span(msg.data(), msgLen), arc4random_uniform(65536))) {
         // If the query couldn't be parsed, block the request.
         LOG(WARNING) << "ResNSendHandler::run: resnsend: from UID " << uid << ", invalid query";
         sendBE32(mClient, -EINVAL);
@@ -1072,7 +1064,7 @@ void DnsProxyListener::ResNSendHandler::run() {
     initDnsEvent(&event, mNetContext);
     if (startQueryLimiter(uid)) {
         if (evaluate_domain_name(mNetContext, rr_name.c_str())) {
-            ansLen = resolv_res_nsend(&mNetContext, {msg.data(), msgLen}, ansBuf, &rcode,
+            ansLen = resolv_res_nsend(&mNetContext, std::span(msg.data(), msgLen), ansBuf, &rcode,
                                       static_cast<ResNsendFlags>(mFlags), &event);
         } else {
             ansLen = -EAI_SYSTEM;
@@ -1110,7 +1102,7 @@ void DnsProxyListener::ResNSendHandler::run() {
     }
 
     // Restore query id
-    if (!setQueryId({ansBuf.data(), ansLen}, original_query_id)) {
+    if (!setQueryId(std::span(ansBuf.data(), ansLen), original_query_id)) {
         LOG(WARNING) << "ResNSendHandler::run: resnsend: failed to restore query id";
         return;
     }
@@ -1125,7 +1117,7 @@ void DnsProxyListener::ResNSendHandler::run() {
     if (rr_type == ns_t_a || rr_type == ns_t_aaaa) {
         std::vector<std::string> ip_addrs;
         const int total_ip_addr_count =
-                extractResNsendAnswers({ansBuf.data(), ansLen}, rr_type, &ip_addrs);
+                extractResNsendAnswers(std::span(ansBuf.data(), ansLen), rr_type, &ip_addrs);
         reportDnsEvent(INetdEventListener::EVENT_RES_NSEND, mNetContext, latencyUs,
                        resNSendToAiError(ansLen, rcode), event, rr_name, ip_addrs,
                        total_ip_addr_count);
@@ -1245,17 +1237,10 @@ void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hoste
     }
 
     // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
-    const uid_t uid = mClient->getUid();
-    if (startQueryLimiter(uid)) {
-        const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
-        *rv = resolv_gethostbyname(name, AF_INET, hbuf, buf, buflen, &mNetContext, hpp, event);
-        endQueryLimiter(uid);
-        if (*rv) {
-            *rv = EAI_NODATA;  // return original error code
-            return;
-        }
-    } else {
-        LOG(ERROR) << __func__ << ": from UID " << uid << ", max concurrent queries reached";
+    const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
+    *rv = resolv_gethostbyname(name, AF_INET, hbuf, buf, buflen, &mNetContext, hpp, event);
+    if (*rv) {
+        *rv = EAI_NODATA;  // return original error code
         return;
     }
 
@@ -1282,6 +1267,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
         if (evaluate_domain_name(mNetContext, name)) {
             rv = resolv_gethostbyname(name, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext, &hp,
                                       &event);
+            doDns64Synthesis(&rv, &hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
         } else {
             rv = EAI_SYSTEM;
         }
@@ -1292,7 +1278,6 @@ void DnsProxyListener::GetHostByNameHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64Synthesis(&rv, &hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
     const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
     event.set_latency_micros(latencyUs);
     event.set_event_type(EVENT_GETHOSTBYNAME);
@@ -1407,27 +1392,21 @@ void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(hostent* hbuf,
         return;
     }
 
-    const uid_t uid = mClient->getUid();
-    if (startQueryLimiter(uid)) {
-        // Remove NAT64 prefix and do reverse DNS query
-        struct in_addr v4addr = {.s_addr = v6addr.s6_addr32[3]};
-        resolv_gethostbyaddr(&v4addr, sizeof(v4addr), AF_INET, hbuf, buf, buflen, &mNetContext, hpp,
-                             event);
-        endQueryLimiter(uid);
-        if (*hpp && (*hpp)->h_addr_list[0]) {
-            // Replace IPv4 address with original queried IPv6 address in place. The space has
-            // reserved by dns_gethtbyaddr() and netbsd_gethostent_r() in
-            // system/netd/resolv/gethnamaddr.cpp.
-            // Note that resolv_gethostbyaddr() returns only one entry in result.
-            char* addr = (*hpp)->h_addr_list[0];
-            memcpy(addr, &v6addr, sizeof(v6addr));
-            (*hpp)->h_addrtype = AF_INET6;
-            (*hpp)->h_length = sizeof(struct in6_addr);
-        } else {
-            LOG(ERROR) << __func__ << ": hpp or (*hpp)->h_addr_list[0] is null";
-        }
+    // Remove NAT64 prefix and do reverse DNS query
+    struct in_addr v4addr = {.s_addr = v6addr.s6_addr32[3]};
+    resolv_gethostbyaddr(&v4addr, sizeof(v4addr), AF_INET, hbuf, buf, buflen, &mNetContext, hpp,
+                         event);
+    if (*hpp && (*hpp)->h_addr_list[0]) {
+        // Replace IPv4 address with original queried IPv6 address in place. The space has
+        // reserved by dns_gethtbyaddr() and netbsd_gethostent_r() in
+        // system/netd/resolv/gethnamaddr.cpp.
+        // Note that resolv_gethostbyaddr() returns only one entry in result.
+        char* addr = (*hpp)->h_addr_list[0];
+        memcpy(addr, &v6addr, sizeof(v6addr));
+        (*hpp)->h_addrtype = AF_INET6;
+        (*hpp)->h_length = sizeof(struct in6_addr);
     } else {
-        LOG(ERROR) << __func__ << ": from UID " << uid << ", max concurrent queries reached";
+        LOG(ERROR) << __func__ << ": hpp or (*hpp)->h_addr_list[0] is null";
     }
 }
 
@@ -1454,6 +1433,7 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
         } else {
             rv = resolv_gethostbyaddr(&mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
                                       sizeof tmpbuf, &mNetContext, &hp, &event);
+            doDns64ReverseLookup(&hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
         }
         endQueryLimiter(uid);
     } else {
@@ -1462,7 +1442,6 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64ReverseLookup(&hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
     const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
     event.set_latency_micros(latencyUs);
     event.set_event_type(EVENT_GETHOSTBYADDR);
