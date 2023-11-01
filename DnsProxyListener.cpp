@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <linux/if.h>
 #include <math.h>
 #include <net/if.h>
@@ -661,6 +662,54 @@ std::string makeThreadName(unsigned netId, uint32_t uid) {
     return fmt::format("Dns_{}_{}", netId, multiuser_get_app_id(uid));
 }
 
+typedef int (*InitFn)();
+typedef int (*IsUidBlockedFn)(uid_t, bool);
+
+IsUidBlockedFn ADnsHelper_isUidNetworkingBlocked;
+
+IsUidBlockedFn resolveIsUidNetworkingBlockedFn() {
+    // Related BPF maps were mainlined from T.
+    if (!isAtLeastT()) return nullptr;
+
+    // TODO: Check whether it is safe to shared link the .so without using dlopen when the carrier
+    // APEX module (tethering) is fully released.
+    void* handle = dlopen("libcom.android.tethering.dns_helper.so", RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        LOG(WARNING) << __func__ << ": " << dlerror();
+        return nullptr;
+    }
+
+    InitFn ADnsHelper_init = reinterpret_cast<InitFn>(dlsym(handle, "ADnsHelper_init"));
+    if (!ADnsHelper_init) {
+        LOG(ERROR) << __func__ << ": " << dlerror();
+        abort();
+    }
+    const int ret = (*ADnsHelper_init)();
+    if (ret) {
+        LOG(ERROR) << __func__ << ": ADnsHelper_init failed " << strerror(-ret);
+        abort();
+    }
+
+    IsUidBlockedFn f =
+            reinterpret_cast<IsUidBlockedFn>(dlsym(handle, "ADnsHelper_isUidNetworkingBlocked"));
+    if (!f) {
+        LOG(ERROR) << __func__ << ": " << dlerror();
+        abort();
+    }
+    return f;
+}
+
+bool isUidNetworkingBlocked(uid_t uid, unsigned netId) {
+    if (!ADnsHelper_isUidNetworkingBlocked) return false;
+
+    // The enforceDnsUid is an OEM feature that sets DNS packet with AID_DNS instead of the
+    // application's UID. Its DNS packets are not subject to certain network restriction features.
+    if (resolv_is_enforceDnsUid_enabled_network(netId)) return false;
+
+    // TODO: Pass metered information from CS to DNS resolver and replace the hardcode value.
+    return (*ADnsHelper_isUidNetworkingBlocked)(uid, /*metered=*/false) == 1;
+}
+
 }  // namespace
 
 DnsProxyListener::DnsProxyListener() : FrameworkListener(SOCKET_NAME) {
@@ -678,6 +727,8 @@ DnsProxyListener::DnsProxyListener() : FrameworkListener(SOCKET_NAME) {
 
     mGetDnsNetIdCommand = std::make_unique<GetDnsNetIdCommand>();
     registerCmd(mGetDnsNetIdCommand.get());
+
+    ADnsHelper_isUidNetworkingBlocked = resolveIsUidNetworkingBlockedFn();
 }
 
 void DnsProxyListener::Handler::spawn() {
@@ -818,21 +869,14 @@ void DnsProxyListener::GetAddrInfoHandler::doDns64Synthesis(int32_t* rv, addrinf
 
     if (ipv6WantedButNoData) {
         // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
-        const uid_t uid = mClient->getUid();
-        if (startQueryLimiter(uid)) {
-            const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
-            const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
-            mHints->ai_family = AF_INET;
-            // Don't need to do freeaddrinfo(res) before starting new DNS lookup because previous
-            // DNS lookup is failed with error EAI_NODATA.
-            *rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, res, event);
-            endQueryLimiter(uid);
-            if (*rv) {
-                *rv = EAI_NODATA;  // return original error code
-                return;
-            }
-        } else {
-            LOG(ERROR) << __func__ << ": from UID " << uid << ", max concurrent queries reached";
+        const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
+        const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
+        mHints->ai_family = AF_INET;
+        // Don't need to do freeaddrinfo(res) before starting new DNS lookup because previous
+        // DNS lookup is failed with error EAI_NODATA.
+        *rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, res, event);
+        if (*rv) {
+            *rv = EAI_NODATA;  // return original error code
             return;
         }
     }
@@ -860,11 +904,15 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (startQueryLimiter(uid)) {
+    if (isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid)) {
+        LOG(INFO) << "GetAddrInfoHandler::run: network access blocked";
+        rv = EAI_FAIL;
+    } else if (startQueryLimiter(uid)) {
         const char* host = mHost.starts_with('^') ? nullptr : mHost.c_str();
         const char* service = mService.starts_with('^') ? nullptr : mService.c_str();
         if (evaluate_domain_name(mNetContext, host)) {
             rv = resolv_getaddrinfo(host, service, mHints.get(), &mNetContext, &result, &event);
+            doDns64Synthesis(&rv, &result, &event);
         } else {
             rv = EAI_SYSTEM;
         }
@@ -877,7 +925,6 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64Synthesis(&rv, &result, &event);
     const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
     event.set_latency_micros(latencyUs);
     event.set_event_type(EVENT_GETADDRINFO);
@@ -1055,8 +1102,8 @@ void DnsProxyListener::ResNSendHandler::run() {
     uint16_t original_query_id = 0;
 
     // TODO: Handle the case which is msg contains more than one query
-    if (!parseQuery({msg.data(), msgLen}, &original_query_id, &rr_type, &rr_name) ||
-        !setQueryId({msg.data(), msgLen}, arc4random_uniform(65536))) {
+    if (!parseQuery(std::span(msg.data(), msgLen), &original_query_id, &rr_type, &rr_name) ||
+        !setQueryId(std::span(msg.data(), msgLen), arc4random_uniform(65536))) {
         // If the query couldn't be parsed, block the request.
         LOG(WARNING) << "ResNSendHandler::run: resnsend: from UID " << uid << ", invalid query";
         sendBE32(mClient, -EINVAL);
@@ -1069,11 +1116,15 @@ void DnsProxyListener::ResNSendHandler::run() {
     int ansLen = -1;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (startQueryLimiter(uid)) {
+    if (isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid)) {
+        LOG(INFO) << "ResNSendHandler::run: network access blocked";
+        ansLen = -ECONNREFUSED;
+    } else if (startQueryLimiter(uid)) {
         if (evaluate_domain_name(mNetContext, rr_name.c_str())) {
-            ansLen = resolv_res_nsend(&mNetContext, {msg.data(), msgLen}, ansBuf, &rcode,
+            ansLen = resolv_res_nsend(&mNetContext, std::span(msg.data(), msgLen), ansBuf, &rcode,
                                       static_cast<ResNsendFlags>(mFlags), &event);
         } else {
+            // TODO(b/307048182): It should return -errno.
             ansLen = -EAI_SYSTEM;
         }
         endQueryLimiter(uid);
@@ -1109,7 +1160,7 @@ void DnsProxyListener::ResNSendHandler::run() {
     }
 
     // Restore query id
-    if (!setQueryId({ansBuf.data(), ansLen}, original_query_id)) {
+    if (!setQueryId(std::span(ansBuf.data(), ansLen), original_query_id)) {
         LOG(WARNING) << "ResNSendHandler::run: resnsend: failed to restore query id";
         return;
     }
@@ -1124,7 +1175,7 @@ void DnsProxyListener::ResNSendHandler::run() {
     if (rr_type == ns_t_a || rr_type == ns_t_aaaa) {
         std::vector<std::string> ip_addrs;
         const int total_ip_addr_count =
-                extractResNsendAnswers({ansBuf.data(), ansLen}, rr_type, &ip_addrs);
+                extractResNsendAnswers(std::span(ansBuf.data(), ansLen), rr_type, &ip_addrs);
         reportDnsEvent(INetdEventListener::EVENT_RES_NSEND, mNetContext, latencyUs,
                        resNSendToAiError(ansLen, rcode), event, rr_name, ip_addrs,
                        total_ip_addr_count);
@@ -1244,17 +1295,10 @@ void DnsProxyListener::GetHostByNameHandler::doDns64Synthesis(int32_t* rv, hoste
     }
 
     // If caller wants IPv6 answers but no data, try to query IPv4 answers for synthesis
-    const uid_t uid = mClient->getUid();
-    if (startQueryLimiter(uid)) {
-        const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
-        *rv = resolv_gethostbyname(name, AF_INET, hbuf, buf, buflen, &mNetContext, hpp, event);
-        endQueryLimiter(uid);
-        if (*rv) {
-            *rv = EAI_NODATA;  // return original error code
-            return;
-        }
-    } else {
-        LOG(ERROR) << __func__ << ": from UID " << uid << ", max concurrent queries reached";
+    const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
+    *rv = resolv_gethostbyname(name, AF_INET, hbuf, buf, buflen, &mNetContext, hpp, event);
+    if (*rv) {
+        *rv = EAI_NODATA;  // return original error code
         return;
     }
 
@@ -1276,11 +1320,15 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (startQueryLimiter(uid)) {
+    if (isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid)) {
+        LOG(INFO) << "GetHostByNameHandler::run: network access blocked";
+        rv = EAI_FAIL;
+    } else if (startQueryLimiter(uid)) {
         const char* name = mName.starts_with('^') ? nullptr : mName.c_str();
         if (evaluate_domain_name(mNetContext, name)) {
             rv = resolv_gethostbyname(name, mAf, &hbuf, tmpbuf, sizeof tmpbuf, &mNetContext, &hp,
                                       &event);
+            doDns64Synthesis(&rv, &hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
         } else {
             rv = EAI_SYSTEM;
         }
@@ -1291,7 +1339,6 @@ void DnsProxyListener::GetHostByNameHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64Synthesis(&rv, &hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
     const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
     event.set_latency_micros(latencyUs);
     event.set_event_type(EVENT_GETHOSTBYNAME);
@@ -1406,27 +1453,21 @@ void DnsProxyListener::GetHostByAddrHandler::doDns64ReverseLookup(hostent* hbuf,
         return;
     }
 
-    const uid_t uid = mClient->getUid();
-    if (startQueryLimiter(uid)) {
-        // Remove NAT64 prefix and do reverse DNS query
-        struct in_addr v4addr = {.s_addr = v6addr.s6_addr32[3]};
-        resolv_gethostbyaddr(&v4addr, sizeof(v4addr), AF_INET, hbuf, buf, buflen, &mNetContext, hpp,
-                             event);
-        endQueryLimiter(uid);
-        if (*hpp && (*hpp)->h_addr_list[0]) {
-            // Replace IPv4 address with original queried IPv6 address in place. The space has
-            // reserved by dns_gethtbyaddr() and netbsd_gethostent_r() in
-            // system/netd/resolv/gethnamaddr.cpp.
-            // Note that resolv_gethostbyaddr() returns only one entry in result.
-            char* addr = (*hpp)->h_addr_list[0];
-            memcpy(addr, &v6addr, sizeof(v6addr));
-            (*hpp)->h_addrtype = AF_INET6;
-            (*hpp)->h_length = sizeof(struct in6_addr);
-        } else {
-            LOG(ERROR) << __func__ << ": hpp or (*hpp)->h_addr_list[0] is null";
-        }
+    // Remove NAT64 prefix and do reverse DNS query
+    struct in_addr v4addr = {.s_addr = v6addr.s6_addr32[3]};
+    resolv_gethostbyaddr(&v4addr, sizeof(v4addr), AF_INET, hbuf, buf, buflen, &mNetContext, hpp,
+                         event);
+    if (*hpp && (*hpp)->h_addr_list[0]) {
+        // Replace IPv4 address with original queried IPv6 address in place. The space has
+        // reserved by dns_gethtbyaddr() and netbsd_gethostent_r() in
+        // system/netd/resolv/gethnamaddr.cpp.
+        // Note that resolv_gethostbyaddr() returns only one entry in result.
+        char* addr = (*hpp)->h_addr_list[0];
+        memcpy(addr, &v6addr, sizeof(v6addr));
+        (*hpp)->h_addrtype = AF_INET6;
+        (*hpp)->h_length = sizeof(struct in6_addr);
     } else {
-        LOG(ERROR) << __func__ << ": from UID " << uid << ", max concurrent queries reached";
+        LOG(ERROR) << __func__ << ": hpp or (*hpp)->h_addr_list[0] is null";
     }
 }
 
@@ -1441,7 +1482,11 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (startQueryLimiter(uid)) {
+
+    if (isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid)) {
+        LOG(INFO) << "GetHostByAddrHandler::run: network access blocked";
+        rv = EAI_FAIL;
+    } else if (startQueryLimiter(uid)) {
         // From Android U, evaluate_domain_name() is not only for OEM customization, but also tells
         // DNS resolver whether the UID can send DNS on the specified network. The function needs
         // to be called even when there is no domain name to evaluate (GetHostByAddr). This is
@@ -1453,6 +1498,7 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
         } else {
             rv = resolv_gethostbyaddr(&mAddress, mAddressLen, mAddressFamily, &hbuf, tmpbuf,
                                       sizeof tmpbuf, &mNetContext, &hp, &event);
+            doDns64ReverseLookup(&hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
         }
         endQueryLimiter(uid);
     } else {
@@ -1461,7 +1507,6 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
                    << ", max concurrent queries reached";
     }
 
-    doDns64ReverseLookup(&hbuf, tmpbuf, sizeof tmpbuf, &hp, &event);
     const int32_t latencyUs = saturate_cast<int32_t>(s.timeTakenUs());
     event.set_latency_micros(latencyUs);
     event.set_event_type(EVENT_GETHOSTBYADDR);
