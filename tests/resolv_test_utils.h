@@ -32,6 +32,7 @@
 #include <netdutils/InternetAddresses.h>
 
 #include "dns_responder/dns_responder.h"
+#include "util.h"
 
 class ScopeBlockedUIDRule {
     using INetd = aidl::android::net::INetd;
@@ -78,6 +79,33 @@ class ScopeBlockedUIDRule {
     Firewall* mFw;
     const uid_t mTestUid;
     const uid_t mSavedUid;
+};
+
+// Supported from T+ only.
+class ScopedSetDataSaverByBPF {
+  public:
+    ScopedSetDataSaverByBPF(bool wanted) {
+        if (android::modules::sdklevel::IsAtLeastT()) {
+            mFw = Firewall::getInstance();
+            // Backup current setting.
+            const Result<bool> current = mFw->getDataSaverSetting();
+            EXPECT_RESULT_OK(current);
+            if (wanted != current.value()) {
+                mSavedDataSaverSetting = current;
+                EXPECT_RESULT_OK(mFw->setDataSaver(wanted));
+            }
+        }
+    };
+    ~ScopedSetDataSaverByBPF() {
+        // Restore the setting.
+        if (mSavedDataSaverSetting.has_value()) {
+            EXPECT_RESULT_OK(mFw->setDataSaver(mSavedDataSaverSetting.value()));
+        }
+    }
+
+  private:
+    Firewall* mFw;
+    Result<bool> mSavedDataSaverSetting;
 };
 
 class ScopedChangeUID {
@@ -402,3 +430,10 @@ android::netdutils::ScopedAddrinfo safe_getaddrinfo(const char* node, const char
 
 void SetMdnsRoute();
 void RemoveMdnsRoute();
+
+#define SKIP_IF_BEFORE_T                                                         \
+    do {                                                                         \
+        if (!isAtLeastT()) {                                                     \
+            GTEST_SKIP() << "Skipping test because SDK version is less than T."; \
+        }                                                                        \
+    } while (0)
