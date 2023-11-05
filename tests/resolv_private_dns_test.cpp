@@ -345,6 +345,28 @@ class BasePrivateDnsTest : public BaseTest {
         EXPECT_EQ(mDnsClient.resolvService()->dump(fd, querylogCmd, std::size(querylogCmd)), 0);
     }
 
+    void expectQueriesAreBlocked() {
+        // getaddrinfo should fail
+        const addrinfo hints = {.ai_socktype = SOCK_DGRAM};
+        EXPECT_FALSE(safe_getaddrinfo(kQueryHostname, nullptr, &hints));
+
+        // gethostbyname should fail
+        EXPECT_FALSE(gethostbyname(kQueryHostname));
+
+        // gethostbyaddr should fail
+        in6_addr v6addr;
+        inet_pton(AF_INET6, "2001:db8::102:304", &v6addr);
+        EXPECT_FALSE(gethostbyaddr(&v6addr, sizeof(v6addr), AF_INET6));
+
+        // resNetworkQuery should fail
+        int fd = resNetworkQuery(TEST_NETID, kQueryHostname, ns_c_in, ns_t_aaaa, 0);
+        EXPECT_TRUE(fd != -1);
+
+        uint8_t buf[MAXPACKET] = {};
+        int rcode;
+        EXPECT_EQ(-ECONNREFUSED, getAsyncResponse(fd, &rcode, buf, MAXPACKET));
+    }
+
     static constexpr milliseconds kExpectedDohValidationTimeWhenTimeout{1000};
     static constexpr milliseconds kExpectedDohValidationTimeWhenServerUnreachable{1000};
     static constexpr char kQueryHostname[] = "TransportParameterizedTest.example.com.";
@@ -525,6 +547,57 @@ TEST_P(TransportParameterizedTest, MdnsGetAddrInfo_fallback) {
         EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 0 /* dot */, 2 /* doh */));
     } else {
         EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 2 /* dot */, 0 /* doh */));
+    }
+}
+
+TEST_P(TransportParameterizedTest, BlockDnsQuery) {
+    SKIP_IF_BEFORE_T;
+    constexpr char ptr_name[] = "v4v6.example.com.";
+    // PTR record for IPv6 address 2001:db8::102:304
+    constexpr char ptr_addr_v6[] =
+            "4.0.3.0.2.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.";
+    const DnsRecord r = {ptr_addr_v6, ns_type::ns_t_ptr, ptr_name};
+    dns.addMapping(r.host_name, r.type, r.addr);
+    dot_backend.addMapping(r.host_name, r.type, r.addr);
+    doh_backend.addMapping(r.host_name, r.type, r.addr);
+
+    auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    if (testParamHasDoh()) EXPECT_TRUE(WaitForDohValidationSuccess(test::kDefaultListenAddr));
+    if (testParamHasDot()) EXPECT_TRUE(WaitForDotValidationSuccess(test::kDefaultListenAddr));
+
+    // This waiting time is expected to avoid that the DoH validation event interferes other tests.
+    if (!testParamHasDoh()) waitForDohValidationFailed();
+
+    // Have the test independent of the number of sent queries in private DNS validation, because
+    // the DnsResolver can send either 1 or 2 queries in DoT validation.
+    if (testParamHasDoh()) {
+        doh.clearQueries();
+    }
+    if (testParamHasDot()) {
+        EXPECT_TRUE(dot.waitForQueries(1));
+        dot.clearQueries();
+    }
+    dns.clearQueries();
+
+    for (const bool testDataSaver : {false, true}) {
+        SCOPED_TRACE(fmt::format("test {}", testDataSaver ? "data saver" : "UID firewall rules"));
+        if (testDataSaver) {
+            // Data Saver applies on metered networks only.
+            parcel.meteredNetwork = true;
+            ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+            // Block network access by enabling data saver.
+            ScopedSetDataSaverByBPF scopedSetDataSaverByBPF(true);
+            ScopedChangeUID scopedChangeUID(TEST_UID);
+            expectQueriesAreBlocked();
+        } else {
+            // Block network access by setting UID firewall rules.
+            ScopeBlockedUIDRule scopeBlockUidRule(mDnsClient.netdService(), TEST_UID);
+            expectQueriesAreBlocked();
+        }
+        expectQueries(0 /* dns */, 0 /* dot */, 0 /* doh */);
     }
 }
 
