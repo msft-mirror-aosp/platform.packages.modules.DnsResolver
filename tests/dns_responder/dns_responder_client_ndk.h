@@ -91,6 +91,15 @@ class ResolverParams {
             mParcel.retryCount = params[IDnsResolver::RESOLVER_PARAMS_RETRY_COUNT];
             return *this;
         }
+        constexpr Builder& setMetered(const bool metered) {
+            mParcel.meteredNetwork = metered;
+            return *this;
+        }
+        constexpr Builder& setDohParams(
+                const aidl::android::net::resolv::aidl::DohParamsParcel& dohParams) {
+            mParcel.dohParams = dohParams;
+            return *this;
+        }
         aidl::android::net::ResolverParamsParcel build() { return mParcel; }
 
       private:
