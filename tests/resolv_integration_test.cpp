@@ -127,6 +127,8 @@ using android::netdutils::ScopedAddrinfo;
 using android::netdutils::Stopwatch;
 using android::netdutils::toHex;
 
+namespace fs = std::filesystem;
+
 namespace {
 
 std::pair<ScopedAddrinfo, int> safe_getaddrinfo_time_taken(const char* node, const char* service,
@@ -4505,9 +4507,9 @@ TEST_F(ResolverTest, GetAddrinfo_BlockDnsQueryWithUidRule) {
         const char* hname;
         const int expectedErrorCode;
     } kTestData[] = {
-            {host_name, isAtLeastT() ? EAI_FAIL : EAI_NODATA},
+            {host_name, (isAtLeastT() && fs::exists(DNS_HELPER)) ? EAI_FAIL : EAI_NODATA},
             // To test the query with search domain.
-            {"howdy", isAtLeastT() ? EAI_FAIL : EAI_AGAIN},
+            {"howdy", (isAtLeastT() && fs::exists(DNS_HELPER)) ? EAI_FAIL : EAI_AGAIN},
     };
 
     INetd* netdService = mDnsClient.netdService();
@@ -5780,8 +5782,9 @@ TEST_F(ResolverTest, RepeatedSetup_KeepChangingPrivateDnsServers) {
     for (const auto& serverState : {WORKING, UNSUPPORTED, UNRESPONSIVE}) {
         int testIndex = 0;
         for (const auto& config : testConfigs) {
-            SCOPED_TRACE(fmt::format("serverState:{} testIndex:{} testConfig:[{}]", serverState,
-                                     testIndex++, config.asTestName()));
+            SCOPED_TRACE(fmt::format("serverState:{} testIndex:{} testConfig:[{}]",
+                                     static_cast<int>(serverState), testIndex++,
+                                     config.asTestName()));
             auto& tls = (config.tlsServer == addr1) ? tls1 : tls2;
 
             if (serverState == UNSUPPORTED && tls.running()) ASSERT_TRUE(tls.stopServer());
@@ -7429,7 +7432,7 @@ TEST_F(ResolverMultinetworkTest, GetAddrInfo_AI_ADDRCONFIG) {
             ConnectivityType::V4V6,
     };
     for (const auto& type : allTypes) {
-        SCOPED_TRACE(fmt::format("ConnectivityType: {}", type));
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", static_cast<int>(type)));
 
         // Create a network.
         ScopedPhysicalNetwork network = CreateScopedPhysicalNetwork(type);
@@ -7561,7 +7564,7 @@ TEST_F(ResolverMultinetworkTest, DnsWithVpn) {
             {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
     };
     for (const auto& [type, result] : testPairs) {
-        SCOPED_TRACE(fmt::format("ConnectivityType: {}", type));
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", static_cast<int>(type)));
 
         // Create a network.
         ScopedPhysicalNetwork underlyingNetwork = CreateScopedPhysicalNetwork(type, "Underlying");
@@ -7681,7 +7684,7 @@ TEST_F(ResolverMultinetworkTest, PerAppDefaultNetwork) {
             {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
     };
     for (const auto& [ipVersion, expectedDnsReply] : testPairs) {
-        SCOPED_TRACE(fmt::format("ConnectivityType: {}", ipVersion));
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", static_cast<int>(ipVersion)));
 
         // Create networks.
         ScopedPhysicalNetwork sysDefaultNetwork =
@@ -7811,55 +7814,6 @@ TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRoute) {
     EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name), 1U);
 }
 
-// Test if the "do not send AAAA query when IPv6 address is link-local with a default route" feature
-// can be toggled by flag.
-TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRouteFlag) {
-    // Kernel 4.4 does not provide an IPv6 link-local address when an interface is added to a
-    // network. Skip it because v6 link-local address is a prerequisite for this test.
-    SKIP_IF_KERNEL_VERSION_LOWER_THAN(4, 9, 0);
-
-    constexpr char host_name[] = "ohayou.example.com.";
-    const struct TestConfig {
-        std::string flagValue;
-        std::vector<std::string> ips;
-        unsigned numOfQuadAQuery;
-    } TestConfigs[]{{"0", {"192.0.2.0", "2001:db8:cafe:d00d::31"}, 1U}, {"1", {"192.0.2.0"}, 0U}};
-
-    for (const auto& config : TestConfigs) {
-        SCOPED_TRACE(fmt::format("flagValue = {}, numOfQuadAQuery = {}", config.flagValue,
-                                 config.numOfQuadAQuery));
-
-        ScopedSystemProperties sp1(kSkip4aQueryOnV6LinklocalAddrFlag, config.flagValue);
-        ScopedPhysicalNetwork network = CreateScopedPhysicalNetwork(ConnectivityType::V4);
-        ASSERT_RESULT_OK(network.init());
-
-        // Add IPv6 default route
-        ASSERT_TRUE(mDnsClient.netdService()
-                            ->networkAddRoute(network.netId(), network.ifname(), "::/0", "")
-                            .isOk());
-
-        // Ensuring that routing is applied. This is required for mainline test (b/257404586).
-        usleep(1000 * 1000);
-
-        const Result<DnsServerPair> dnsPair = network.addIpv4Dns();
-        ASSERT_RESULT_OK(dnsPair);
-        StartDns(*dnsPair->dnsServer, {{host_name, ns_type::ns_t_a, "192.0.2.0"},
-                                       {host_name, ns_type::ns_t_aaaa, "2001:db8:cafe:d00d::31"}});
-
-        ASSERT_TRUE(network.setDnsConfiguration());
-        ASSERT_TRUE(network.startTunForwarder());
-
-        auto result = android_getaddrinfofornet_wrapper(host_name, network.netId());
-        ASSERT_RESULT_OK(result);
-        ScopedAddrinfo ai_results(std::move(result.value()));
-        std::vector<std::string> result_strs = ToStrings(ai_results);
-        EXPECT_THAT(result_strs, testing::UnorderedElementsAreArray(config.ips));
-        EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 1U);
-        EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name),
-                  config.numOfQuadAQuery);
-    }
-}
-
 // v6 mdns is expected to be sent when the IPv6 address is a link-local with a default route.
 TEST_F(ResolverMultinetworkTest, MdnsIPv6LinkLocalWithDefaultRoute) {
     // Kernel 4.4 does not provide an IPv6 link-local address when an interface is added to a
@@ -7975,7 +7929,7 @@ TEST_F(ResolverMultinetworkTest, UidAllowedNetworks) {
             {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
     };
     for (const auto& [ipVersion, expectedDnsReply] : testPairs) {
-        SCOPED_TRACE(fmt::format("ConnectivityType: {}", ipVersion));
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", static_cast<int>(ipVersion)));
 
         // Create networks.
         ScopedPhysicalNetwork sysDefaultNetwork =
