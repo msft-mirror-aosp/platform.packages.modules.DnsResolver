@@ -18,8 +18,8 @@
 
 package android.net;
 /* @hide */
-@JavaDerive(equals=true)
-parcelable ResolverHostsParcel {
-  @utf8InCpp String ipAddr;
-  @utf8InCpp String hostName = "";
+parcelable ResolverOptionsParcel {
+  android.net.ResolverHostsParcel[] hosts = {};
+  int tcMode = 0;
+  boolean enforceDnsUid = false;
 }

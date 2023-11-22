@@ -20,6 +20,7 @@
 #include <arpa/nameser.h>
 #include <netdb.h>
 
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@
 #include <netdutils/InternetAddresses.h>
 
 #include "dns_responder/dns_responder.h"
+#include "util.h"
 
 class ScopeBlockedUIDRule {
     using INetd = aidl::android::net::INetd;
@@ -78,6 +80,33 @@ class ScopeBlockedUIDRule {
     Firewall* mFw;
     const uid_t mTestUid;
     const uid_t mSavedUid;
+};
+
+// Supported from T+ only.
+class ScopedSetDataSaverByBPF {
+  public:
+    ScopedSetDataSaverByBPF(bool wanted) {
+        if (android::modules::sdklevel::IsAtLeastT()) {
+            mFw = Firewall::getInstance();
+            // Backup current setting.
+            const Result<bool> current = mFw->getDataSaverSetting();
+            EXPECT_RESULT_OK(current);
+            if (wanted != current.value()) {
+                mSavedDataSaverSetting = current;
+                EXPECT_RESULT_OK(mFw->setDataSaver(wanted));
+            }
+        }
+    };
+    ~ScopedSetDataSaverByBPF() {
+        // Restore the setting.
+        if (mSavedDataSaverSetting.has_value()) {
+            EXPECT_RESULT_OK(mFw->setDataSaver(mSavedDataSaverSetting.value()));
+        }
+    }
+
+  private:
+    Firewall* mFw;
+    Result<bool> mSavedDataSaverSetting;
 };
 
 class ScopedChangeUID {
@@ -155,12 +184,12 @@ const std::string kDotXportUnusableThresholdFlag(kFlagPrefix + "dot_xport_unusab
 const std::string kDotValidationLatencyFactorFlag(kFlagPrefix + "dot_validation_latency_factor");
 const std::string kDotValidationLatencyOffsetMsFlag(kFlagPrefix +
                                                     "dot_validation_latency_offset_ms");
+const std::string kFailFastOnUidNetworkBlockingFlag(kFlagPrefix +
+                                                    "fail_fast_on_uid_network_blocking");
 const std::string kKeepListeningUdpFlag(kFlagPrefix + "keep_listening_udp");
 const std::string kParallelLookupSleepTimeFlag(kFlagPrefix + "parallel_lookup_sleep_time");
 const std::string kRetransIntervalFlag(kFlagPrefix + "retransmission_time_interval");
 const std::string kRetryCountFlag(kFlagPrefix + "retry_count");
-const std::string kSkip4aQueryOnV6LinklocalAddrFlag(kFlagPrefix +
-                                                    "skip_4a_query_on_v6_linklocal_addr");
 const std::string kSortNameserversFlag(kFlagPrefix + "sort_nameservers");
 
 const std::string kPersistNetPrefix("persist.net.");
@@ -402,3 +431,21 @@ android::netdutils::ScopedAddrinfo safe_getaddrinfo(const char* node, const char
 
 void SetMdnsRoute();
 void RemoveMdnsRoute();
+
+#define SKIP_IF_BEFORE_T                                                         \
+    do {                                                                         \
+        if (!isAtLeastT()) {                                                     \
+            GTEST_SKIP() << "Skipping test because SDK version is less than T."; \
+        }                                                                        \
+    } while (0)
+
+static const std::string DNS_HELPER =
+        android::bpf::isUserspace64bit()
+                ? "/apex/com.android.tethering/lib64/libcom.android.tethering.dns_helper.so"
+                : "/apex/com.android.tethering/lib/libcom.android.tethering.dns_helper.so";
+
+#define SKIP_IF_DEPENDENT_LIB_DOES_NOT_EXIST(libPath)                  \
+    do {                                                               \
+        if (!std::filesystem::exists(libPath))                         \
+            GTEST_SKIP() << "Required " << (libPath) << " not found."; \
+    } while (0)
