@@ -184,6 +184,8 @@ const std::string kDotXportUnusableThresholdFlag(kFlagPrefix + "dot_xport_unusab
 const std::string kDotValidationLatencyFactorFlag(kFlagPrefix + "dot_validation_latency_factor");
 const std::string kDotValidationLatencyOffsetMsFlag(kFlagPrefix +
                                                     "dot_validation_latency_offset_ms");
+const std::string kFailFastOnUidNetworkBlockingFlag(kFlagPrefix +
+                                                    "fail_fast_on_uid_network_blocking");
 const std::string kKeepListeningUdpFlag(kFlagPrefix + "keep_listening_udp");
 const std::string kParallelLookupSleepTimeFlag(kFlagPrefix + "parallel_lookup_sleep_time");
 const std::string kRetransIntervalFlag(kFlagPrefix + "retransmission_time_interval");
@@ -437,10 +439,11 @@ void RemoveMdnsRoute();
         }                                                                        \
     } while (0)
 
+bool is64bitAbi();
+
 static const std::string DNS_HELPER =
-        android::bpf::isUserspace64bit()
-                ? "/apex/com.android.tethering/lib64/libcom.android.tethering.dns_helper.so"
-                : "/apex/com.android.tethering/lib/libcom.android.tethering.dns_helper.so";
+        is64bitAbi() ? "/apex/com.android.tethering/lib64/libcom.android.tethering.dns_helper.so"
+                     : "/apex/com.android.tethering/lib/libcom.android.tethering.dns_helper.so";
 
 #define SKIP_IF_DEPENDENT_LIB_DOES_NOT_EXIST(libPath)                  \
     do {                                                               \

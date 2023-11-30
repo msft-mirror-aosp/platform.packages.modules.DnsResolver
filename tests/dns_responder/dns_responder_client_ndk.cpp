@@ -30,6 +30,7 @@ using aidl::android::net::IDnsResolver;
 using aidl::android::net::INetd;
 using aidl::android::net::ResolverOptionsParcel;
 using aidl::android::net::ResolverParamsParcel;
+using aidl::android::net::resolv::aidl::DohParamsParcel;
 using android::base::Error;
 using android::base::Result;
 using android::net::ResolverStats;
@@ -51,6 +52,7 @@ ResolverParams::Builder::Builder() {
     mParcel.tlsServers = {kDefaultServer};
     mParcel.caCertificate = kCaCert;
     mParcel.resolverOptions = ResolverOptionsParcel{};  // optional, must be explicitly set.
+    mParcel.dohParams = std::nullopt;
 }
 
 void DnsResponderClient::SetupMappings(unsigned numHosts, const std::vector<std::string>& domains,
@@ -113,22 +115,6 @@ Result<ResolverInfo> DnsResponderClient::getResolverInfo() {
     ResolverStats::decodeAll(stats, &out.stats);
 
     return std::move(out);
-}
-
-bool DnsResponderClient::SetResolversForNetwork(const std::vector<std::string>& servers,
-                                                const std::vector<std::string>& domains,
-                                                std::vector<int> params) {
-    params.resize(IDnsResolver::RESOLVER_PARAMS_COUNT);
-    std::array<int, IDnsResolver::RESOLVER_PARAMS_COUNT> arr;
-    std::copy_n(params.begin(), arr.size(), arr.begin());
-    const auto resolverParams = ResolverParams::Builder()
-                                        .setDomains(domains)
-                                        .setDnsServers(servers)
-                                        .setDotServers({})
-                                        .setParams(arr)
-                                        .build();
-    const auto rv = mDnsResolvSrv->setResolverConfiguration(resolverParams);
-    return rv.isOk();
 }
 
 bool DnsResponderClient::SetResolversForNetwork(const std::vector<std::string>& servers,
