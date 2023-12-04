@@ -322,10 +322,12 @@ void maybeLogQuery(int eventType, const android_net_context& netContext,
 
 void reportDnsEvent(int eventType, const android_net_context& netContext, int latencyUs,
                     int returnCode, NetworkDnsEventReported& event, const std::string& query_name,
-                    const std::vector<std::string>& ip_addrs = {}, int total_ip_addr_count = 0) {
-    uint32_t rate =
-            (query_name.ends_with(".local") && is_mdns_supported_network(netContext.dns_netid) &&
-             android::net::Experiments::getInstance()->getFlag("mdns_resolution", 1))
+                    bool skipStats, const std::vector<std::string>& ip_addrs = {},
+                    int total_ip_addr_count = 0) {
+    int32_t rate =
+            skipStats ? 0
+            : (query_name.ends_with(".local") && is_mdns_supported_network(netContext.dns_netid) &&
+               android::net::Experiments::getInstance()->getFlag("mdns_resolution", 1))
                     ? getDnsEventSubsamplingRate(netContext.dns_netid, returnCode, true)
                     : getDnsEventSubsamplingRate(netContext.dns_netid, returnCode, false);
 
@@ -334,11 +336,12 @@ void reportDnsEvent(int eventType, const android_net_context& netContext, int la
         stats::BytesField dnsQueryBytesField{dnsQueryStats.c_str(), dnsQueryStats.size()};
         event.set_return_code(static_cast<ReturnCode>(returnCode));
         event.set_network_type(resolv_get_network_types_for_net(netContext.dns_netid));
-        android::net::stats::stats_write(android::net::stats::NETWORK_DNS_EVENT_REPORTED,
-                                         event.event_type(), event.return_code(),
-                                         event.latency_micros(), event.hints_ai_flags(),
-                                         event.res_nsend_flags(), event.network_type(),
-                                         event.private_dns_modes(), dnsQueryBytesField, rate);
+        event.set_uid(netContext.uid);
+        android::net::stats::stats_write(
+                android::net::stats::NETWORK_DNS_EVENT_REPORTED, event.event_type(),
+                event.return_code(), event.latency_micros(), event.hints_ai_flags(),
+                event.res_nsend_flags(), event.network_type(), event.private_dns_modes(),
+                dnsQueryBytesField, rate, event.uid());
     }
 
     maybeLogQuery(eventType, netContext, event, query_name, ip_addrs);
@@ -706,8 +709,13 @@ bool isUidNetworkingBlocked(uid_t uid, unsigned netId) {
     // application's UID. Its DNS packets are not subject to certain network restriction features.
     if (resolv_is_enforceDnsUid_enabled_network(netId)) return false;
 
-    // TODO: Pass metered information from CS to DNS resolver and replace the hardcode value.
-    return (*ADnsHelper_isUidNetworkingBlocked)(uid, /*metered=*/false) == 1;
+    // Feature flag that can disable the feature.
+    if (!android::net::Experiments::getInstance()->getFlag("fail_fast_on_uid_network_blocking",
+                                                           1)) {
+        return false;
+    }
+
+    return (*ADnsHelper_isUidNetworkingBlocked)(uid, resolv_is_metered_network(netId)) == 1;
 }
 
 }  // namespace
@@ -904,7 +912,8 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid)) {
+    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid);
+    if (isUidBlocked) {
         LOG(INFO) << "GetAddrInfoHandler::run: network access blocked";
         rv = EAI_FAIL;
     } else if (startQueryLimiter(uid)) {
@@ -952,7 +961,7 @@ void DnsProxyListener::GetAddrInfoHandler::run() {
     std::vector<std::string> ip_addrs;
     const int total_ip_addr_count = extractGetAddrInfoAnswers(result, &ip_addrs);
     reportDnsEvent(INetdEventListener::EVENT_GETADDRINFO, mNetContext, latencyUs, rv, event, mHost,
-                   ip_addrs, total_ip_addr_count);
+                   isUidBlocked, ip_addrs, total_ip_addr_count);
     freeaddrinfo(result);
 }
 
@@ -1116,7 +1125,8 @@ void DnsProxyListener::ResNSendHandler::run() {
     int ansLen = -1;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid)) {
+    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid);
+    if (isUidBlocked) {
         LOG(INFO) << "ResNSendHandler::run: network access blocked";
         ansLen = -ECONNREFUSED;
     } else if (startQueryLimiter(uid)) {
@@ -1147,7 +1157,7 @@ void DnsProxyListener::ResNSendHandler::run() {
         }
         if (rr_type == ns_t_a || rr_type == ns_t_aaaa) {
             reportDnsEvent(INetdEventListener::EVENT_RES_NSEND, mNetContext, latencyUs,
-                           resNSendToAiError(ansLen, rcode), event, rr_name);
+                           resNSendToAiError(ansLen, rcode), event, rr_name, isUidBlocked);
         }
         return;
     }
@@ -1177,8 +1187,8 @@ void DnsProxyListener::ResNSendHandler::run() {
         const int total_ip_addr_count =
                 extractResNsendAnswers(std::span(ansBuf.data(), ansLen), rr_type, &ip_addrs);
         reportDnsEvent(INetdEventListener::EVENT_RES_NSEND, mNetContext, latencyUs,
-                       resNSendToAiError(ansLen, rcode), event, rr_name, ip_addrs,
-                       total_ip_addr_count);
+                       resNSendToAiError(ansLen, rcode), event, rr_name, /*skipStats=*/false,
+                       ip_addrs, total_ip_addr_count);
     }
 }
 
@@ -1320,7 +1330,8 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     int32_t rv = 0;
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
-    if (isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid)) {
+    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid);
+    if (isUidBlocked) {
         LOG(INFO) << "GetHostByNameHandler::run: network access blocked";
         rv = EAI_FAIL;
     } else if (startQueryLimiter(uid)) {
@@ -1364,7 +1375,7 @@ void DnsProxyListener::GetHostByNameHandler::run() {
     std::vector<std::string> ip_addrs;
     const int total_ip_addr_count = extractGetHostByNameAnswers(hp, &ip_addrs);
     reportDnsEvent(INetdEventListener::EVENT_GETHOSTBYNAME, mNetContext, latencyUs, rv, event,
-                   mName, ip_addrs, total_ip_addr_count);
+                   mName, isUidBlocked, ip_addrs, total_ip_addr_count);
 }
 
 std::string DnsProxyListener::GetHostByNameHandler::threadName() {
@@ -1483,7 +1494,8 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     NetworkDnsEventReported event;
     initDnsEvent(&event, mNetContext);
 
-    if (isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid)) {
+    const bool isUidBlocked = isUidNetworkingBlocked(mNetContext.uid, mNetContext.dns_netid);
+    if (isUidBlocked) {
         LOG(INFO) << "GetHostByAddrHandler::run: network access blocked";
         rv = EAI_FAIL;
     } else if (startQueryLimiter(uid)) {
@@ -1529,7 +1541,7 @@ void DnsProxyListener::GetHostByAddrHandler::run() {
     }
 
     reportDnsEvent(INetdEventListener::EVENT_GETHOSTBYADDR, mNetContext, latencyUs, rv, event,
-                   (hp && hp->h_name) ? hp->h_name : "null", {}, 0);
+                   (hp && hp->h_name) ? hp->h_name : "null", isUidBlocked, {}, 0);
 }
 
 std::string DnsProxyListener::GetHostByAddrHandler::threadName() {
