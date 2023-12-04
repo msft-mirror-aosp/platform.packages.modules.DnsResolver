@@ -1065,6 +1065,7 @@ struct NetConfig {
     int tc_mode = aidl::android::net::IDnsResolver::TC_MODE_DEFAULT;
     bool enforceDnsUid = false;
     std::vector<int32_t> transportTypes;
+    bool metered = false;
 };
 
 /* gets cache associated with a network, or NULL if none exists */
@@ -1214,7 +1215,7 @@ static void _cache_remove_oldest(Cache* cache) {
         return;
     }
     LOG(DEBUG) << __func__ << ": Cache full - removing oldest";
-    res_pquery({oldest->query, oldest->querylen});
+    res_pquery(std::span(oldest->query, oldest->querylen));
     _cache_remove_p(cache, lookup);
 }
 
@@ -1318,13 +1319,13 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
     /* remove stale entries here */
     if (now >= e->expires) {
         LOG(DEBUG) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
-        res_pquery({e->query, e->querylen});
+        res_pquery(std::span(e->query, e->querylen));
         _cache_remove_p(cache, lookup);
         return RESOLV_CACHE_NOTFOUND;
     }
 
     *answerlen = e->answerlen;
-    if (e->answerlen > answer.size()) {
+    if (e->answerlen > static_cast<ptrdiff_t>(answer.size())) {
         /* NOTE: we return UNSUPPORTED if the answer buffer is too short */
         LOG(INFO) << __func__ << ": ANSWER TOO LONG";
         return RESOLV_CACHE_UNSUPPORTED;
@@ -1642,7 +1643,7 @@ std::vector<std::string> getCustomizedTableByName(const size_t netid, const char
 int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
                            const std::vector<std::string>& domains, const res_params& params,
                            const std::optional<ResolverOptionsParcel> optionalResolverOptions,
-                           const std::vector<int32_t>& transportTypes) {
+                           const std::vector<int32_t>& transportTypes, bool metered) {
     std::vector<std::string> nameservers = filter_nameservers(servers);
     const int numservers = static_cast<int>(nameservers.size());
 
@@ -1709,6 +1710,7 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
         return -EINVAL;
     }
     netconfig->transportTypes = transportTypes;
+    netconfig->metered = metered;
     if (optionalResolverOptions.has_value()) {
         const ResolverOptionsParcel& resolverOptions = optionalResolverOptions.value();
         return netconfig->setOptions(resolverOptions);
@@ -2090,6 +2092,7 @@ void resolv_netconfig_dump(DumpWriter& dw, unsigned netid) {
         // TODO: dump info->hosts
         dw.println("TC mode: %s", tc_mode_to_str(info->tc_mode));
         dw.println("TransportType: %s", transport_type_to_str(info->transportTypes));
+        dw.println("Metered: %s", info->metered ? "true" : "false");
     }
 }
 
@@ -2101,4 +2104,20 @@ int resolv_get_max_cache_entries(unsigned netid) {
         return -1;
     }
     return info->cache->get_max_cache_entries();
+}
+
+bool resolv_is_enforceDnsUid_enabled_network(unsigned netid) {
+    std::lock_guard guard(cache_mutex);
+    if (const auto info = find_netconfig_locked(netid); info != nullptr) {
+        return info->enforceDnsUid;
+    }
+    return false;
+}
+
+bool resolv_is_metered_network(unsigned netid) {
+    std::lock_guard guard(cache_mutex);
+    if (const auto info = find_netconfig_locked(netid); info != nullptr) {
+        return info->metered;
+    }
+    return false;
 }
