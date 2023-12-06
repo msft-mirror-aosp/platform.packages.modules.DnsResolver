@@ -29,6 +29,7 @@
 #include <netdutils/InternetAddresses.h>
 #include <netdutils/NetNativeTestBase.h>
 #include <netdutils/Stopwatch.h>
+#include <nettestutils/DumpService.h>
 
 #include "doh_frontend.h"
 #include "tests/dns_responder/dns_responder.h"
@@ -52,6 +53,7 @@ using android::netdutils::ScopedAddrinfo;
 using android::netdutils::Stopwatch;
 using std::chrono::milliseconds;
 using std::this_thread::sleep_for;
+using ::testing::AnyOf;
 
 constexpr int MAXPACKET = (8 * 1024);
 
@@ -59,33 +61,6 @@ constexpr int MAXPACKET = (8 * 1024);
 constexpr int kDohIdleDefaultTimeoutMs = 55000;
 
 namespace {
-
-std::vector<std::string> dumpService(ndk::SpAIBinder binder) {
-    unique_fd localFd, remoteFd;
-    bool success = Pipe(&localFd, &remoteFd);
-    EXPECT_TRUE(success) << "Failed to open pipe for dumping: " << strerror(errno);
-    if (!success) return {};
-
-    // dump() blocks until another thread has consumed all its output.
-    std::thread dumpThread = std::thread([binder, remoteFd{std::move(remoteFd)}]() {
-        EXPECT_EQ(STATUS_OK, AIBinder_dump(binder.get(), remoteFd, nullptr, 0));
-    });
-
-    std::string dumpContent;
-
-    EXPECT_TRUE(ReadFdToString(localFd.get(), &dumpContent))
-            << "Error during dump: " << strerror(errno);
-    dumpThread.join();
-
-    std::stringstream dumpStream(std::move(dumpContent));
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(dumpStream, line)) {
-        lines.push_back(std::move(line));
-    }
-
-    return lines;
-}
 
 int getAsyncResponse(int fd, int* rcode, uint8_t* buf, int bufLen) {
     struct pollfd wait_fd[1];
@@ -240,9 +215,13 @@ class BaseTest : public NetNativeTestBase {
     }
 
     bool expectLog(const std::string& ipAddrOrNoData, const std::string& port) {
-        ndk::SpAIBinder resolvBinder = ndk::SpAIBinder(AServiceManager_getService("dnsresolver"));
-        assert(nullptr != resolvBinder.get());
-        std::vector<std::string> lines = dumpService(resolvBinder);
+        std::vector<std::string> lines;
+        const android::status_t ret =
+                dumpService(sResolvBinder, /*args=*/nullptr, /*num_args=*/0, lines);
+        if (ret != android::OK) {
+            ADD_FAILURE() << "Error dumping service: " << android::statusToString(ret);
+            return false;
+        }
 
         const std::string expectedLog =
                 port.empty() ? ipAddrOrNoData
@@ -342,6 +321,28 @@ class BasePrivateDnsTest : public BaseTest {
 
         const char* querylogCmd[] = {"querylog"};  // Keep it sync with DnsQueryLog::DUMP_KEYWORD.
         EXPECT_EQ(mDnsClient.resolvService()->dump(fd, querylogCmd, std::size(querylogCmd)), 0);
+    }
+
+    void expectQueriesAreBlocked() {
+        // getaddrinfo should fail
+        const addrinfo hints = {.ai_socktype = SOCK_DGRAM};
+        EXPECT_FALSE(safe_getaddrinfo(kQueryHostname, nullptr, &hints));
+
+        // gethostbyname should fail
+        EXPECT_FALSE(gethostbyname(kQueryHostname));
+
+        // gethostbyaddr should fail
+        in6_addr v6addr;
+        inet_pton(AF_INET6, "2001:db8::102:304", &v6addr);
+        EXPECT_FALSE(gethostbyaddr(&v6addr, sizeof(v6addr), AF_INET6));
+
+        // resNetworkQuery should fail
+        int fd = resNetworkQuery(TEST_NETID, kQueryHostname, ns_c_in, ns_t_aaaa, 0);
+        EXPECT_TRUE(fd != -1);
+
+        uint8_t buf[MAXPACKET] = {};
+        int rcode;
+        EXPECT_EQ(-ECONNREFUSED, getAsyncResponse(fd, &rcode, buf, MAXPACKET));
     }
 
     static constexpr milliseconds kExpectedDohValidationTimeWhenTimeout{1000};
@@ -524,6 +525,123 @@ TEST_P(TransportParameterizedTest, MdnsGetAddrInfo_fallback) {
         EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 0 /* dot */, 2 /* doh */));
     } else {
         EXPECT_NO_FAILURE(expectQueries(2 /* dns */, 2 /* dot */, 0 /* doh */));
+    }
+}
+
+TEST_P(TransportParameterizedTest, BlockDnsQuery) {
+    SKIP_IF_BEFORE_T;
+    SKIP_IF_DEPENDENT_LIB_DOES_NOT_EXIST(DNS_HELPER);
+
+    constexpr char ptr_name[] = "v4v6.example.com.";
+    // PTR record for IPv6 address 2001:db8::102:304
+    constexpr char ptr_addr_v6[] =
+            "4.0.3.0.2.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.";
+    const DnsRecord r = {ptr_addr_v6, ns_type::ns_t_ptr, ptr_name};
+    dns.addMapping(r.host_name, r.type, r.addr);
+    dot_backend.addMapping(r.host_name, r.type, r.addr);
+    doh_backend.addMapping(r.host_name, r.type, r.addr);
+
+    auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    if (testParamHasDoh()) EXPECT_TRUE(WaitForDohValidationSuccess(test::kDefaultListenAddr));
+    if (testParamHasDot()) EXPECT_TRUE(WaitForDotValidationSuccess(test::kDefaultListenAddr));
+
+    // This waiting time is expected to avoid that the DoH validation event interferes other tests.
+    if (!testParamHasDoh()) waitForDohValidationFailed();
+
+    // Have the test independent of the number of sent queries in private DNS validation, because
+    // the DnsResolver can send either 1 or 2 queries in DoT validation.
+    if (testParamHasDoh()) {
+        doh.clearQueries();
+    }
+    if (testParamHasDot()) {
+        EXPECT_TRUE(dot.waitForQueries(1));
+        dot.clearQueries();
+    }
+    dns.clearQueries();
+
+    for (const bool testDataSaver : {false, true}) {
+        SCOPED_TRACE(fmt::format("test {}", testDataSaver ? "data saver" : "UID firewall rules"));
+        if (testDataSaver) {
+            // Data Saver applies on metered networks only.
+            parcel.meteredNetwork = true;
+            ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+            // Block network access by enabling data saver.
+            ScopedSetDataSaverByBPF scopedSetDataSaverByBPF(true);
+            ScopedChangeUID scopedChangeUID(TEST_UID);
+            expectQueriesAreBlocked();
+        } else {
+            // Block network access by setting UID firewall rules.
+            ScopeBlockedUIDRule scopeBlockUidRule(mDnsClient.netdService(), TEST_UID);
+            expectQueriesAreBlocked();
+        }
+        expectQueries(0 /* dns */, 0 /* dot */, 0 /* doh */);
+    }
+}
+
+// Verify whether the DNS fail-fast feature can be turned off by flag.
+TEST_P(TransportParameterizedTest, BlockDnsQuery_FlaggedOff) {
+    SKIP_IF_BEFORE_T;
+    SKIP_IF_DEPENDENT_LIB_DOES_NOT_EXIST(DNS_HELPER);
+
+    constexpr char ptr_name[] = "v4v6.example.com.";
+    // PTR record for IPv6 address 2001:db8::102:304
+    constexpr char ptr_addr_v6[] =
+            "4.0.3.0.2.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.";
+    const DnsRecord r = {ptr_addr_v6, ns_type::ns_t_ptr, ptr_name};
+    dns.addMapping(r.host_name, r.type, r.addr);
+    dot_backend.addMapping(r.host_name, r.type, r.addr);
+    doh_backend.addMapping(r.host_name, r.type, r.addr);
+
+    ScopedSystemProperties sp1(kFailFastOnUidNetworkBlockingFlag, "0");
+    resetNetwork();
+
+    auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+    ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+    if (testParamHasDoh()) EXPECT_TRUE(WaitForDohValidationSuccess(test::kDefaultListenAddr));
+    if (testParamHasDot()) EXPECT_TRUE(WaitForDotValidationSuccess(test::kDefaultListenAddr));
+
+    // This waiting time is expected to avoid that the DoH validation event interferes other tests.
+    if (!testParamHasDoh()) waitForDohValidationFailed();
+
+    // Have the test independent of the number of sent queries in private DNS validation, because
+    // the DnsResolver can send either 1 or 2 queries in DoT validation.
+    if (testParamHasDoh()) {
+        doh.clearQueries();
+    }
+    if (testParamHasDot()) {
+        EXPECT_TRUE(dot.waitForQueries(1));
+        dot.clearQueries();
+    }
+    dns.clearQueries();
+
+    for (const bool testDataSaver : {false, true}) {
+        SCOPED_TRACE(fmt::format("test {}", testDataSaver ? "data saver" : "UID firewall rules"));
+        if (testDataSaver) {
+            // Data Saver applies on metered networks only.
+            parcel.meteredNetwork = true;
+            ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+
+            // Block network access by enabling data saver.
+            ScopedSetDataSaverByBPF scopedSetDataSaverByBPF(true);
+            ScopedChangeUID scopedChangeUID(TEST_UID);
+            EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+        } else {
+            // Block network access by setting UID firewall rules.
+            ScopeBlockedUIDRule scopeBlockUidRule(mDnsClient.netdService(), TEST_UID);
+            EXPECT_NO_FAILURE(sendQueryAndCheckResult());
+        }
+
+        if (testParamHasDoh()) {
+            EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
+            dot.clearQueries();
+        } else {
+            EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 2 /* dot */, 0 /* doh */));
+            doh.clearQueries();
+        }
     }
 }
 
@@ -804,9 +922,19 @@ TEST_F(PrivateDnsDohTest, TemporaryConnectionStalled) {
 TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     const int total_queries = 70;
 
-    // The number is from MAX_BUFFERED_COMMANDS + 2 (one that will be queued in
-    // connection mpsc channel; the other one that will get blocked at dispatcher sending channel).
-    const int timeout_queries = 52;
+    // In most cases, the number of timed-out DoH queries is MAX_BUFFERED_COMMANDS + 2 (one that
+    // will be queued in connection's mpsc::channel; the other one that will get blocked at
+    // dispatcher's mpsc::channel), as shown below:
+    //
+    // dispatcher's mpsc::channel -----> network's mpsc:channel -----> connection's mpsc::channel
+    // (expect 1 query queued here)   (size: MAX_BUFFERED_COMMANDS)   (expect 1 query queued here)
+    //
+    // However, it's still possible that the (MAX_BUFFERED_COMMANDS + 2)th query is sent to the DoH
+    // engine before the DoH engine moves a query to connection's mpsc::channel. In that case,
+    // the (MAX_BUFFERED_COMMANDS + 2)th query will be fallback'ed to DoT immediately rather than
+    // be waiting until DoH timeout, which result in only (MAX_BUFFERED_COMMANDS + 1) timed-out
+    // DoH queries.
+    const int doh_timeout_queries = 52;
 
     // If early data flag is enabled, DnsResolver doesn't wait for the connection established.
     // It will send DNS queries along with 0-RTT rather than queue them in connection mpsc channel.
@@ -829,7 +957,7 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
     dns.clearQueries();
 
     // Set the DoT server not to close the connection until it receives enough queries or timeout.
-    dot.setDelayQueries(total_queries - timeout_queries);
+    dot.setDelayQueries(total_queries - doh_timeout_queries);
     dot.setDelayQueriesTimeout(200);
 
     // Set the server blocking, wait for the connection closed, and send some DNS requests.
@@ -847,8 +975,10 @@ TEST_F(PrivateDnsDohTest, ExcessDnsRequests) {
 
     // There are some queries that fall back to DoT rather than UDP since the DoH client rejects
     // any new DNS requests when the capacity is full.
-    EXPECT_NO_FAILURE(expectQueries(timeout_queries /* dns */,
-                                    total_queries - timeout_queries /* dot */, 0 /* doh */));
+    EXPECT_THAT(dns.queries().size(), AnyOf(doh_timeout_queries, doh_timeout_queries - 1));
+    EXPECT_THAT(dot.queries(), AnyOf(total_queries - doh_timeout_queries,
+                                     total_queries - doh_timeout_queries + 1));
+    EXPECT_EQ(doh.queries(), 0);
 
     // Set up another network and send a DNS query. Expect that this network is unaffected.
     constexpr int TEST_NETID_2 = 31;
