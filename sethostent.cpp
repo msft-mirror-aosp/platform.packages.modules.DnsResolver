@@ -69,6 +69,8 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
     char* aliases[MAXALIASES];
     char* addr_ptrs[MAXADDRS];
 
+    // TODO: Wrap the 'hf' into a RAII class or std::shared_ptr and modify the
+    // sethostent_r()/endhostent_r() to get rid of manually endhostent_r(&hf) everywhere.
     FILE* hf = NULL;
     sethostent_r(&hf);
     if (hf == NULL) {
@@ -80,6 +82,7 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
     }
 
     if ((ptr = buf = (char*) malloc(len = info->buflen)) == NULL) {
+        endhostent_r(&hf);
         return EAI_MEMORY;
     }
 
@@ -103,6 +106,7 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
 
         if (hp->h_name == nullptr) {
             free(buf);
+            endhostent_r(&hf);
             return EAI_FAIL;
         }
         const char* h_name = hp->h_name;
@@ -131,6 +135,7 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
         if (num >= MAXADDRS) goto nospc;
         if (hp->h_addr_list[0] == nullptr) {
             free(buf);
+            endhostent_r(&hf);
             return EAI_FAIL;
         }
         const char* addr = hp->h_addr_list[0];
@@ -185,6 +190,7 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
     free(buf);
     return 0;
 nospc:
+    endhostent_r(&hf);
     free(buf);
     return EAI_MEMORY;
 }
