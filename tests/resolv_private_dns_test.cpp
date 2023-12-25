@@ -541,6 +541,13 @@ TEST_P(TransportParameterizedTest, BlockDnsQuery) {
     dot_backend.addMapping(r.host_name, r.type, r.addr);
     doh_backend.addMapping(r.host_name, r.type, r.addr);
 
+    // TODO: Remove the flags and fix the test.
+    // These two flags are not necessary for this test case because the test does not expect DNS
+    // queries to be sent by DNS resolver. However, We should still set these two flags so that we
+    // don't forget to set them when writing similar tests in the future by referring to this one.
+    ScopedSystemProperties sp1(kDotAsyncHandshakeFlag, "0");
+    ScopedSystemProperties sp2(kDotMaxretriesFlag, "3");
+
     auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
     ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
 
@@ -575,14 +582,14 @@ TEST_P(TransportParameterizedTest, BlockDnsQuery) {
             // DataSaver information is only meaningful after V.
             // TODO: Add 'else' to check that DNS queries are not blocked before V.
             if (android::modules::sdklevel::IsAtLeastV()) {
-                expectQueriesAreBlocked();
+                EXPECT_NO_FAILURE(expectQueriesAreBlocked());
             }
         } else {
             // Block network access by setting UID firewall rules.
             ScopeBlockedUIDRule scopeBlockUidRule(mDnsClient.netdService(), TEST_UID);
-            expectQueriesAreBlocked();
+            EXPECT_NO_FAILURE(expectQueriesAreBlocked());
         }
-        expectQueries(0 /* dns */, 0 /* dot */, 0 /* doh */);
+        EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 0 /* doh */));
     }
 }
 
@@ -601,6 +608,13 @@ TEST_P(TransportParameterizedTest, BlockDnsQuery_FlaggedOff) {
     doh_backend.addMapping(r.host_name, r.type, r.addr);
 
     ScopedSystemProperties sp1(kFailFastOnUidNetworkBlockingFlag, "0");
+    // TODO: Remove the flags and fix the test.
+    // Context: Fake DoT server closes SSL connection after replying to each query. But a single DNS
+    // API can send two queries for A and AAAA. One of them will failed in MTS because the current
+    // setting pushed by server is no retry.
+    ScopedSystemProperties sp2(kDotAsyncHandshakeFlag, "0");
+    ScopedSystemProperties sp3(kDotMaxretriesFlag, "3");
+
     resetNetwork();
 
     auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
@@ -642,11 +656,12 @@ TEST_P(TransportParameterizedTest, BlockDnsQuery_FlaggedOff) {
 
         if (testParamHasDoh()) {
             EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 0 /* dot */, 2 /* doh */));
-            dot.clearQueries();
+            doh.clearQueries();
         } else {
             EXPECT_NO_FAILURE(expectQueries(0 /* dns */, 2 /* dot */, 0 /* doh */));
-            doh.clearQueries();
+            dot.clearQueries();
         }
+        flushCache();
     }
 }
 
