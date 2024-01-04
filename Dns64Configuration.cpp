@@ -24,7 +24,6 @@
 #include <netdutils/DumpWriter.h>
 #include <netdutils/InternetAddresses.h>
 #include <netdutils/ThreadUtil.h>
-#include <utils/StrongPointer.h>
 #include <thread>
 #include <utility>
 
@@ -37,7 +36,6 @@
 
 namespace android {
 
-using android::sp;
 using netdutils::DumpWriter;
 using netdutils::IPAddress;
 using netdutils::IPPrefix;
@@ -63,7 +61,7 @@ void Dns64Configuration::startPrefixDiscovery(unsigned netId) {
     // Emplace a copy of |cfg| in the map.
     mDns64Configs.emplace(std::make_pair(netId, cfg));
 
-    const sp<Dns64Configuration> thiz = sp<Dns64Configuration>::fromExisting(this);
+    const std::shared_ptr<Dns64Configuration> thiz = shared_from_this();
     // Note that capturing |cfg| in this lambda creates a copy.
     std::thread discovery_thread([thiz, cfg, netId] {
         setThreadName(fmt::format("Nat64Pfx_{}", netId));
