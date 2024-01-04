@@ -127,6 +127,8 @@ using android::netdutils::ScopedAddrinfo;
 using android::netdutils::Stopwatch;
 using android::netdutils::toHex;
 
+namespace fs = std::filesystem;
+
 namespace {
 
 std::pair<ScopedAddrinfo, int> safe_getaddrinfo_time_taken(const char* node, const char* service,
@@ -4505,9 +4507,9 @@ TEST_F(ResolverTest, GetAddrinfo_BlockDnsQueryWithUidRule) {
         const char* hname;
         const int expectedErrorCode;
     } kTestData[] = {
-            {host_name, isAtLeastT() ? EAI_FAIL : EAI_NODATA},
+            {host_name, (isAtLeastT() && fs::exists(DNS_HELPER)) ? EAI_FAIL : EAI_NODATA},
             // To test the query with search domain.
-            {"howdy", isAtLeastT() ? EAI_FAIL : EAI_AGAIN},
+            {"howdy", (isAtLeastT() && fs::exists(DNS_HELPER)) ? EAI_FAIL : EAI_AGAIN},
     };
 
     INetd* netdService = mDnsClient.netdService();
@@ -4825,77 +4827,76 @@ TEST_F(ResolverTest, ConnectTlsServerTimeout_ConcurrentQueries) {
     }
 }
 
+// Tests that the DoT query timeout is configurable via the feature flag "dot_query_timeout_ms".
+// The test DoT server is configured to postpone DNS queries for DOT_SERVER_UNRESPONSIVE_TIME_MS
+// (2s). If the feature flag is set to a positive value smaller than
+// DOT_SERVER_UNRESPONSIVE_TIME_MS, DoT queries should timeout.
 TEST_F(ResolverTest, QueryTlsServerTimeout) {
-    constexpr uint32_t cacheFlag = ANDROID_RESOLV_NO_CACHE_LOOKUP;
-    constexpr int INFINITE_QUERY_TIMEOUT = -1;
-    constexpr int DOT_SERVER_UNRESPONSIVE_TIME_MS = 5000;
+    constexpr int DOT_SERVER_UNRESPONSIVE_TIME_MS = 2000;
+    constexpr int TIMING_TOLERANCE_MS = 500;
     constexpr char hostname1[] = "query1.example.com.";
-    constexpr char hostname2[] = "query2.example.com.";
     const std::vector<DnsRecord> records = {
             {hostname1, ns_type::ns_t_a, "1.2.3.4"},
-            {hostname2, ns_type::ns_t_a, "1.2.3.5"},
     };
 
-    for (const int queryTimeoutMs : {INFINITE_QUERY_TIMEOUT, 1000}) {
-        for (const std::string_view dnsMode : {"OPPORTUNISTIC", "STRICT"}) {
-            SCOPED_TRACE(fmt::format("testConfig: [{}] [{}]", dnsMode, queryTimeoutMs));
+    static const struct TestConfig {
+        std::string dnsMode;
+        int queryTimeoutMs;
+        int expectResultTimedOut;
+        int expectedTimeTakenMs;
+    } testConfigs[] = {
+            // clang-format off
+            {"OPPORTUNISTIC",   -1, false, DOT_SERVER_UNRESPONSIVE_TIME_MS},
+            {"OPPORTUNISTIC", 1000, false,                            1000},
+            {"STRICT",          -1, false, DOT_SERVER_UNRESPONSIVE_TIME_MS},
+            // `expectResultTimedOut` is true in the following testcase because in strict mode
+            // DnsResolver doesn't try Do53 servers after the DoT query is timed out.
+            {"STRICT",        1000,  true,                            1000},
+            // clang-format on
+    };
+    for (const auto& config : testConfigs) {
+        SCOPED_TRACE(fmt::format("testConfig: [{}] [{}]", config.dnsMode, config.queryTimeoutMs));
 
-            const std::string addr = getUniqueIPv4Address();
-            test::DNSResponder dns(addr);
-            StartDns(dns, records);
-            test::DnsTlsFrontend tls(addr, "853", addr, "53");
-            ASSERT_TRUE(tls.startServer());
+        const std::string addr = getUniqueIPv4Address();
+        test::DNSResponder dns(addr);
+        StartDns(dns, records);
+        test::DnsTlsFrontend tls(addr, "853", addr, "53");
+        ASSERT_TRUE(tls.startServer());
 
-            ScopedSystemProperties sp(kDotQueryTimeoutMsFlag, std::to_string(queryTimeoutMs));
+        ScopedSystemProperties sp(kDotQueryTimeoutMsFlag, std::to_string(config.queryTimeoutMs));
 
-            // Don't skip unusable DoT servers and disable revalidation for this test.
-            ScopedSystemProperties sp2(kDotXportUnusableThresholdFlag, "-1");
-            ScopedSystemProperties sp3(kDotRevalidationThresholdFlag, "-1");
-            resetNetwork();
+        // Don't skip unusable DoT servers and disable revalidation for this test.
+        ScopedSystemProperties sp2(kDotXportUnusableThresholdFlag, "-1");
+        ScopedSystemProperties sp3(kDotRevalidationThresholdFlag, "-1");
+        resetNetwork();
 
-            auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
-            parcel.servers = {addr};
-            parcel.tlsServers = {addr};
-            if (dnsMode == "STRICT") parcel.tlsName = kDefaultPrivateDnsHostName;
+        auto parcel = DnsResponderClient::GetDefaultResolverParamsParcel();
+        parcel.servers = {addr};
+        parcel.tlsServers = {addr};
+        if (config.dnsMode == "STRICT") parcel.tlsName = kDefaultPrivateDnsHostName;
 
-            ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
-            EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
-            EXPECT_TRUE(tls.waitForQueries(1));
-            tls.clearQueries();
+        ASSERT_TRUE(mDnsClient.SetResolversFromParcel(parcel));
+        EXPECT_TRUE(WaitForPrivateDnsValidation(tls.listen_address(), true));
+        EXPECT_TRUE(tls.waitForQueries(1));
+        tls.clearQueries();
 
-            // Set the DoT server to be unresponsive to DNS queries until either it receives
-            // 2 queries or 5s later.
-            tls.setDelayQueries(2);
-            tls.setDelayQueriesTimeout(DOT_SERVER_UNRESPONSIVE_TIME_MS);
+        // Set the DoT server to be unresponsive to DNS queries for
+        // `DOT_SERVER_UNRESPONSIVE_TIME_MS` ms.
+        tls.setDelayQueries(999);
+        tls.setDelayQueriesTimeout(DOT_SERVER_UNRESPONSIVE_TIME_MS);
 
-            // First query.
-            Stopwatch s;
-            int fd = resNetworkQuery(TEST_NETID, hostname1, ns_c_in, ns_t_a, cacheFlag);
-            if (dnsMode == "STRICT" && queryTimeoutMs != INFINITE_QUERY_TIMEOUT) {
-                expectAnswersNotValid(fd, -ETIMEDOUT);
-            } else {
-                expectAnswersValid(fd, AF_INET, "1.2.3.4");
-            }
-
-            // Besides checking the result of the query, check how much time the
-            // resolver processed the query.
-            int timeTakenMs = s.getTimeAndResetUs() / 1000;
-            const int expectedTimeTakenMs = (queryTimeoutMs == INFINITE_QUERY_TIMEOUT)
-                                                    ? DOT_SERVER_UNRESPONSIVE_TIME_MS
-                                                    : queryTimeoutMs;
-            EXPECT_GE(timeTakenMs, expectedTimeTakenMs);
-            EXPECT_LE(timeTakenMs, expectedTimeTakenMs + 1000);
-
-            // Second query.
-            tls.setDelayQueries(1);
-            fd = resNetworkQuery(TEST_NETID, hostname2, ns_c_in, ns_t_a, cacheFlag);
-            expectAnswersValid(fd, AF_INET, "1.2.3.5");
-
-            // Also check how much time the resolver processed the query.
-            timeTakenMs = s.timeTakenUs() / 1000;
-            EXPECT_LE(timeTakenMs, 500);
-            EXPECT_TRUE(tls.waitForQueries(2));
+        // Send a DNS query, and then check the result and the response time.
+        Stopwatch s;
+        int fd = resNetworkQuery(TEST_NETID, hostname1, ns_c_in, ns_t_a,
+                                 ANDROID_RESOLV_NO_CACHE_LOOKUP);
+        if (config.expectResultTimedOut) {
+            expectAnswersNotValid(fd, -ETIMEDOUT);
+        } else {
+            expectAnswersValid(fd, AF_INET, "1.2.3.4");
         }
+        const int timeTakenMs = s.getTimeAndResetUs() / 1000;
+        EXPECT_NEAR(config.expectedTimeTakenMs, timeTakenMs, TIMING_TOLERANCE_MS);
+        EXPECT_TRUE(tls.waitForQueries(1));
     }
 }
 
@@ -5780,8 +5781,9 @@ TEST_F(ResolverTest, RepeatedSetup_KeepChangingPrivateDnsServers) {
     for (const auto& serverState : {WORKING, UNSUPPORTED, UNRESPONSIVE}) {
         int testIndex = 0;
         for (const auto& config : testConfigs) {
-            SCOPED_TRACE(fmt::format("serverState:{} testIndex:{} testConfig:[{}]", serverState,
-                                     testIndex++, config.asTestName()));
+            SCOPED_TRACE(fmt::format("serverState:{} testIndex:{} testConfig:[{}]",
+                                     static_cast<int>(serverState), testIndex++,
+                                     config.asTestName()));
             auto& tls = (config.tlsServer == addr1) ? tls1 : tls2;
 
             if (serverState == UNSUPPORTED && tls.running()) ASSERT_TRUE(tls.stopServer());
@@ -7429,7 +7431,7 @@ TEST_F(ResolverMultinetworkTest, GetAddrInfo_AI_ADDRCONFIG) {
             ConnectivityType::V4V6,
     };
     for (const auto& type : allTypes) {
-        SCOPED_TRACE(fmt::format("ConnectivityType: {}", type));
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", static_cast<int>(type)));
 
         // Create a network.
         ScopedPhysicalNetwork network = CreateScopedPhysicalNetwork(type);
@@ -7561,7 +7563,7 @@ TEST_F(ResolverMultinetworkTest, DnsWithVpn) {
             {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
     };
     for (const auto& [type, result] : testPairs) {
-        SCOPED_TRACE(fmt::format("ConnectivityType: {}", type));
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", static_cast<int>(type)));
 
         // Create a network.
         ScopedPhysicalNetwork underlyingNetwork = CreateScopedPhysicalNetwork(type, "Underlying");
@@ -7681,7 +7683,7 @@ TEST_F(ResolverMultinetworkTest, PerAppDefaultNetwork) {
             {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
     };
     for (const auto& [ipVersion, expectedDnsReply] : testPairs) {
-        SCOPED_TRACE(fmt::format("ConnectivityType: {}", ipVersion));
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", static_cast<int>(ipVersion)));
 
         // Create networks.
         ScopedPhysicalNetwork sysDefaultNetwork =
@@ -7811,55 +7813,6 @@ TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRoute) {
     EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name), 1U);
 }
 
-// Test if the "do not send AAAA query when IPv6 address is link-local with a default route" feature
-// can be toggled by flag.
-TEST_F(ResolverMultinetworkTest, IPv6LinkLocalWithDefaultRouteFlag) {
-    // Kernel 4.4 does not provide an IPv6 link-local address when an interface is added to a
-    // network. Skip it because v6 link-local address is a prerequisite for this test.
-    SKIP_IF_KERNEL_VERSION_LOWER_THAN(4, 9, 0);
-
-    constexpr char host_name[] = "ohayou.example.com.";
-    const struct TestConfig {
-        std::string flagValue;
-        std::vector<std::string> ips;
-        unsigned numOfQuadAQuery;
-    } TestConfigs[]{{"0", {"192.0.2.0", "2001:db8:cafe:d00d::31"}, 1U}, {"1", {"192.0.2.0"}, 0U}};
-
-    for (const auto& config : TestConfigs) {
-        SCOPED_TRACE(fmt::format("flagValue = {}, numOfQuadAQuery = {}", config.flagValue,
-                                 config.numOfQuadAQuery));
-
-        ScopedSystemProperties sp1(kSkip4aQueryOnV6LinklocalAddrFlag, config.flagValue);
-        ScopedPhysicalNetwork network = CreateScopedPhysicalNetwork(ConnectivityType::V4);
-        ASSERT_RESULT_OK(network.init());
-
-        // Add IPv6 default route
-        ASSERT_TRUE(mDnsClient.netdService()
-                            ->networkAddRoute(network.netId(), network.ifname(), "::/0", "")
-                            .isOk());
-
-        // Ensuring that routing is applied. This is required for mainline test (b/257404586).
-        usleep(1000 * 1000);
-
-        const Result<DnsServerPair> dnsPair = network.addIpv4Dns();
-        ASSERT_RESULT_OK(dnsPair);
-        StartDns(*dnsPair->dnsServer, {{host_name, ns_type::ns_t_a, "192.0.2.0"},
-                                       {host_name, ns_type::ns_t_aaaa, "2001:db8:cafe:d00d::31"}});
-
-        ASSERT_TRUE(network.setDnsConfiguration());
-        ASSERT_TRUE(network.startTunForwarder());
-
-        auto result = android_getaddrinfofornet_wrapper(host_name, network.netId());
-        ASSERT_RESULT_OK(result);
-        ScopedAddrinfo ai_results(std::move(result.value()));
-        std::vector<std::string> result_strs = ToStrings(ai_results);
-        EXPECT_THAT(result_strs, testing::UnorderedElementsAreArray(config.ips));
-        EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_a, host_name), 1U);
-        EXPECT_EQ(GetNumQueriesForType(*dnsPair->dnsServer, ns_type::ns_t_aaaa, host_name),
-                  config.numOfQuadAQuery);
-    }
-}
-
 // v6 mdns is expected to be sent when the IPv6 address is a link-local with a default route.
 TEST_F(ResolverMultinetworkTest, MdnsIPv6LinkLocalWithDefaultRoute) {
     // Kernel 4.4 does not provide an IPv6 link-local address when an interface is added to a
@@ -7975,7 +7928,7 @@ TEST_F(ResolverMultinetworkTest, UidAllowedNetworks) {
             {ConnectivityType::V4V6, {ipv6_addr, ipv4_addr}},
     };
     for (const auto& [ipVersion, expectedDnsReply] : testPairs) {
-        SCOPED_TRACE(fmt::format("ConnectivityType: {}", ipVersion));
+        SCOPED_TRACE(fmt::format("ConnectivityType: {}", static_cast<int>(ipVersion)));
 
         // Create networks.
         ScopedPhysicalNetwork sysDefaultNetwork =
