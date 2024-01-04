@@ -155,7 +155,7 @@ int getDnsInfo(unsigned netId, std::vector<std::string>* servers, std::vector<st
 }  // namespace
 
 ResolverController::ResolverController()
-    : mDns64Configuration(android::sp<Dns64Configuration>::make(
+    : mDns64Configuration(make_shared<Dns64Configuration>(
               [](uint32_t netId, uint32_t uid, android_net_context* netcontext) {
                   gResNetdCallbacks.get_network_context(netId, uid, netcontext);
               },

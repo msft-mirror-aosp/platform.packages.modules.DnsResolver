@@ -685,7 +685,8 @@ IsUidBlockedFn resolveIsUidNetworkingBlockedFn() {
     InitFn ADnsHelper_init = reinterpret_cast<InitFn>(dlsym(handle, "ADnsHelper_init"));
     if (!ADnsHelper_init) {
         LOG(ERROR) << __func__ << ": " << dlerror();
-        abort();
+        // TODO: Change to abort() when NDK is finalized
+        return nullptr;
     }
     const int ret = (*ADnsHelper_init)();
     if (ret) {
@@ -697,7 +698,8 @@ IsUidBlockedFn resolveIsUidNetworkingBlockedFn() {
             reinterpret_cast<IsUidBlockedFn>(dlsym(handle, "ADnsHelper_isUidNetworkingBlocked"));
     if (!f) {
         LOG(ERROR) << __func__ << ": " << dlerror();
-        abort();
+        // TODO: Change to abort() when NDK is finalized
+        return nullptr;
     }
     return f;
 }
