@@ -27,7 +27,6 @@
 #include <android-base/thread_annotations.h>
 #include <netdutils/DumpWriter.h>
 #include <netdutils/InternetAddresses.h>
-#include <utils/RefBase.h>
 
 struct android_net_context;
 
@@ -49,7 +48,7 @@ namespace net {
  * Thread-safety: All public methods in this class MUST be thread-safe.
  * (In other words: this class handles all its locking privately.)
  */
-class Dns64Configuration : virtual public RefBase {
+class Dns64Configuration : public std::enable_shared_from_this<Dns64Configuration> {
   public:
     // Simple data struct for passing back packet NAT64 prefix event information to the
     // Dns64PrefixCallback callback.
