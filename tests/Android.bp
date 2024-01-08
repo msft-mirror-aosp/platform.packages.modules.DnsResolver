@@ -192,21 +192,24 @@ cc_test {
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
+        "libc++fs",
         "libconnectivity_native_test_utils",
         "libcrypto_static",
+        "libcutils",
+        "libdoh_frontend_ffi",
         "libgmock",
+        "libip_checksum",
         "libmodules-utils-build",
         "libnetd_test_dnsresponder_ndk",
         "libnetd_test_metrics_listener",
         "libnetd_test_resolv_utils",
         "libnetdutils",
+        "libnettestutils",
         "libssl",
-        "libcutils",
+        "libutils",
         "netd_aidl_interface-lateststable-ndk",
         "netd_event_listener_interface-lateststable-ndk",
-        "libip_checksum",
         "resolv_unsolicited_listener",
-        "libdoh_frontend_ffi",
     ],
     // This test talks to the DnsResolver module over a binary protocol on a socket, so keep it as
     // multilib setting is worth because we might be able to get some coverage for the case where
@@ -377,6 +380,18 @@ cc_defaults {
         "server_configurable_flags",
         "stats_proto",
     ],
+    target: {
+        android: {
+            shared_libs: [
+                "libutils",
+            ],
+        },
+        host: {
+            static_libs: [
+                "libutils",
+            ],
+        },
+    },
     fuzz_config: {
        cc: [
             "cken@google.com",
@@ -421,14 +436,12 @@ cc_fuzz {
             shared_libs: [
                 "libbinder_ndk",
                 "libbinder",
-                "libutils",
             ],
         },
         host: {
             static_libs: [
                 "libbinder_ndk",
                 "libbinder",
-                "libutils",
             ],
         },
         darwin: {
