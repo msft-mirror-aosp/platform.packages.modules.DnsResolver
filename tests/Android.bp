@@ -274,7 +274,6 @@ cc_test {
         "libstatslog_resolv",
         "libstatspush_compat",
         "libsysutils",
-        "libutils",
         "resolv_stats_test_utils",
         "server_configurable_flags",
         "stats_proto",
