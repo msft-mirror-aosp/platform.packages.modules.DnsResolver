@@ -198,7 +198,9 @@ pub extern "C" fn frontend_stats_clear_queries(doh: &DohFrontend) -> bool {
 #[no_mangle]
 pub extern "C" fn init_android_logger() {
     android_logger::init_once(
-        android_logger::Config::default().with_tag("DohFrontend").with_min_level(log::Level::Debug),
+        android_logger::Config::default()
+            .with_tag("DohFrontend")
+            .with_max_level(log::LevelFilter::Debug),
     );
 }
 
