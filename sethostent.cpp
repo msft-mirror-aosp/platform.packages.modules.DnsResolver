@@ -132,7 +132,6 @@ int _hf_gethtbyname2(const char* name, int af, getnamaddr* info) {
             if ((size_t)(ptr - buf) >= info->buflen) goto nospc;
         }
 
-        if (num >= MAXADDRS) goto nospc;
         if (hp->h_addr_list[0] == nullptr) {
             free(buf);
             endhostent_r(&hf);
