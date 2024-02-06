@@ -1,4 +1,5 @@
 package {
+    default_team: "trendy_team_fwk_core_networking",
     // See: http://go/android-license-faq
     // A large-scale-change added 'default_applicable_licenses' to import
     // all of the 'license_kinds' from "packages_modules_DnsResolver_license"
@@ -9,7 +10,10 @@ package {
 
 cc_test_library {
     name: "libnetd_test_resolv_utils",
-    defaults: ["netd_defaults", "resolv_test_defaults"],
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+    ],
     srcs: [
         "resolv_test_utils.cpp",
     ],
@@ -64,9 +68,9 @@ genrule {
     srcs: ["testdata/*.pbtxt"],
     // convert .pbtxt to .pb files; zip them as a single pb.zip.
     cmd: "mkdir $(genDir)/pb && for fname in $(in); " +
-         "do $(location resolv_gold_test_pbtxt2pb_host) --in_file=$$fname " +
-         "--out_dir=$(genDir)/pb; done && " +
-         "$(location soong_zip) -o $(out) -C $(genDir)/pb -D $(genDir)/pb",
+        "do $(location resolv_gold_test_pbtxt2pb_host) --in_file=$$fname " +
+        "--out_dir=$(genDir)/pb; done && " +
+        "$(location soong_zip) -o $(out) -C $(genDir)/pb -D $(genDir)/pb",
     out: ["testdata/pb.zip"],
 }
 
@@ -85,14 +89,20 @@ cc_library_static {
 
 cc_test {
     name: "resolv_gold_test",
-    test_suites: ["general-tests", "mts-dnsresolver"],
+    test_suites: [
+        "general-tests",
+        "mts-dnsresolver",
+    ],
     isolated: false,
     require_root: true,
     // b/151392634, this is a workaround because MTS
     // can not handle the test with testdata correctly.
     // TODO: Remove the xml after MTS fixing the problem.
     test_config: "resolv_gold_test_config.xml",
-    defaults: ["netd_defaults", "resolv_test_defaults"],
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+    ],
     data: [":resolv_gold_test_pbtxt2pb"],
     srcs: [
         "resolv_gold_test.cpp",
@@ -136,12 +146,19 @@ cc_test {
 
 cc_test {
     name: "resolv_stress_test",
-    test_suites: ["general-tests", "mts-dnsresolver"],
+    test_suites: [
+        "general-tests",
+        "mts-dnsresolver",
+    ],
     isolated: false,
     // This won't work with test_config
     // require_root: true,
     // TODO: Remove resolv_test_mts_coverage_defaults after mts coverage switched to 64-bit device.
-    defaults: ["netd_defaults", "resolv_test_defaults", "resolv_test_mts_coverage_defaults"],
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+        "resolv_test_mts_coverage_defaults",
+    ],
     srcs: [
         "resolv_stress_test.cpp",
     ],
@@ -165,11 +182,17 @@ cc_test {
 
 cc_test {
     name: "resolv_integration_test",
-    test_suites: ["general-tests", "mts-dnsresolver"],
+    test_suites: [
+        "general-tests",
+        "mts-dnsresolver",
+    ],
     isolated: false,
     require_root: true,
     test_config_template: ":resolv_test_config_template",
-    defaults: ["netd_defaults", "resolv_test_defaults"],
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+    ],
     tidy: false, // cuts test build time by > 1m30s
     srcs: [
         "dns_responder/dns_responder.cpp",
@@ -228,7 +251,7 @@ cc_test {
     // after the build process.
     host_required: [
         "net-tests-utils-host-common",
-    ]
+    ],
 }
 
 cc_test {
@@ -283,9 +306,12 @@ cc_test {
 cc_test_library {
     name: "resolv_stats_test_utils",
     srcs: [
-        "resolv_stats_test_utils.cpp"
+        "resolv_stats_test_utils.cpp",
     ],
-    defaults: ["netd_defaults", "resolv_test_defaults"],
+    defaults: [
+        "netd_defaults",
+        "resolv_test_defaults",
+    ],
     export_include_dirs: ["."],
     static_libs: [
         "libgmock",
@@ -393,11 +419,11 @@ cc_defaults {
         },
     },
     fuzz_config: {
-       cc: [
+        cc: [
             "cken@google.com",
             "kfcchen@google.com",
-       ],
-        componentid: 31808,  // Android > Android OS & Apps > Systems > core networking
+        ],
+        componentid: 31808, // Android > Android OS & Apps > Systems > core networking
     },
 }
 
