@@ -672,13 +672,11 @@ static struct addrinfo* get_ai(const struct addrinfo* pai, const struct afd* afd
     assert(afd != NULL);
     assert(addr != NULL);
 
-    ai = (struct addrinfo*) malloc(sizeof(struct addrinfo) + sizeof(sockaddr_union));
+    ai = (struct addrinfo*) calloc(1, sizeof(struct addrinfo) + sizeof(sockaddr_union));
     if (ai == NULL) return NULL;
 
     memcpy(ai, pai, sizeof(struct addrinfo));
     ai->ai_addr = (struct sockaddr*) (void*) (ai + 1);
-    memset(ai->ai_addr, 0, sizeof(sockaddr_union));
-
     ai->ai_addrlen = afd->a_socklen;
     ai->ai_addr->sa_family = ai->ai_family = afd->a_af;
     p = (char*) (void*) (ai->ai_addr);
@@ -1312,8 +1310,7 @@ static int _find_src_addr(const struct sockaddr* addr, struct sockaddr* src_addr
         return -1;
     }
 
-    if (Experiments::getInstance()->getFlag("skip_4a_query_on_v6_linklocal_addr", 1) &&
-        src_addr->sa_family == AF_INET6) {
+    if (src_addr->sa_family == AF_INET6) {
         sockaddr_in6* sin6 = reinterpret_cast<sockaddr_in6*>(src_addr);
         if (!allow_v6_linklocal && IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
             // There is no point in sending an AAAA query because the device does not have a global
@@ -1639,7 +1636,8 @@ QueryResult doQuery(const char* name, res_target* t, ResState* res,
     ResState res_temp = res->clone(&event);
 
     int rcode = NOERROR;
-    n = res_nsend(&res_temp, {buf, n}, {t->answer.data(), anslen}, &rcode, 0, sleepTimeMs);
+    n = res_nsend(&res_temp, std::span(buf, n), std::span(t->answer.data(), anslen), &rcode, 0,
+                  sleepTimeMs);
     if (n < 0 || hp->rcode != NOERROR || ntohs(hp->ancount) == 0) {
         if (rcode != RCODE_TIMEOUT) rcode = hp->rcode;
         // if the query choked with EDNS0, retry without EDNS0
@@ -1648,7 +1646,8 @@ QueryResult doQuery(const char* name, res_target* t, ResState* res,
             (res_temp.flags & RES_F_EDNS0ERR)) {
             LOG(INFO) << __func__ << ": retry without EDNS0";
             n = res_nmkquery(QUERY, name, cl, type, {}, buf, res_temp.netcontext_flags);
-            n = res_nsend(&res_temp, {buf, n}, {t->answer.data(), anslen}, &rcode, 0);
+            n = res_nsend(&res_temp, std::span(buf, n), std::span(t->answer.data(), anslen), &rcode,
+                          0);
         }
     }
 

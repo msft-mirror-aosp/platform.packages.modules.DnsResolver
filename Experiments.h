@@ -17,6 +17,7 @@
 #pragma once
 
 #include <climits>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -47,7 +48,6 @@ class Experiments {
     mutable std::mutex mMutex;
     std::map<std::string_view, int> mFlagsMapInt GUARDED_BY(mMutex);
     static constexpr const char* const kExperimentFlagKeyList[] = {
-            "doh",
             "doh_early_data",
             "doh_idle_timeout_ms",
             "doh_probe_timeout_ms",
@@ -62,6 +62,7 @@ class Experiments {
             "dot_validation_latency_factor",
             "dot_validation_latency_offset_ms",
             "dot_xport_unusable_threshold",
+            "fail_fast_on_uid_network_blocking",
             "keep_listening_udp",
             "max_cache_entries",
             "max_queries_global",
@@ -69,7 +70,6 @@ class Experiments {
             "parallel_lookup_sleep_time",
             "retransmission_time_interval",
             "retry_count",
-            "skip_4a_query_on_v6_linklocal_addr",
             "sort_nameservers",
     };
     // This value is used in updateInternal as the default value if any flags can't be found.

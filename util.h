@@ -62,9 +62,9 @@ inline bool isDebuggable() {
     return android::base::GetBoolProperty("ro.debuggable", false);
 }
 
-inline bool isDoHEnabled() {
-    static bool isAtLeastT = android::modules::sdklevel::IsAtLeastT();
-    return android::net::Experiments::getInstance()->getFlag("doh", isAtLeastT ? 1 : 0);
+inline bool isAtLeastT() {
+    const static bool isAtLeastT = android::modules::sdklevel::IsAtLeastT();
+    return isAtLeastT;
 }
 
 inline bool isAtLeastU() {

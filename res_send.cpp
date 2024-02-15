@@ -491,7 +491,7 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
             res_pquery(ans.first(resplen));
 
             if (cache_status == RESOLV_CACHE_NOTFOUND) {
-                resolv_cache_add(statp->netid, msg, {ans.data(), resplen});
+                resolv_cache_add(statp->netid, msg, std::span(ans.data(), resplen));
             }
             return resplen;
         }
@@ -667,7 +667,7 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
             res_pquery(ans.first(resplen));
 
             if (cache_status == RESOLV_CACHE_NOTFOUND) {
-                resolv_cache_add(statp->netid, msg, {ans.data(), resplen});
+                resolv_cache_add(statp->netid, msg, std::span(ans.data(), resplen));
             }
             statp->closeSockets();
             return (resplen);
@@ -807,7 +807,7 @@ same_ns:
             {.iov_base = const_cast<uint8_t*>(msg.data()),
              .iov_len = static_cast<size_t>(msg.size())},
     };
-    if (writev(statp->tcp_nssock, iov, 2) != (INT16SZ + msg.size())) {
+    if (writev(statp->tcp_nssock, iov, 2) != static_cast<ptrdiff_t>(INT16SZ + msg.size())) {
         *terrno = errno;
         PLOG(DEBUG) << __func__ << ": write failed: ";
         statp->closeSockets();
@@ -1111,7 +1111,8 @@ static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg,
         }
         LOG(DEBUG) << __func__ << ": new DG socket";
     }
-    if (send(statp->udpsocks[*ns], msg.data(), msg.size(), 0) != msg.size()) {
+    if (send(statp->udpsocks[*ns], msg.data(), msg.size(), 0) !=
+        static_cast<ptrdiff_t>(msg.size())) {
         *terrno = errno;
         PLOG(DEBUG) << __func__ << ": send: ";
         statp->closeSockets();
@@ -1155,11 +1156,14 @@ static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg,
                 *terrno = EMSGSIZE;
                 continue;
             }
+            if (resplen > static_cast<ptrdiff_t>(ans.size())) {
+                LOG(FATAL) << __func__ << ": invalid resplen (too large): " << resplen;
+            }
 
             int receivedFromNs = *ns;
             if (needRetry = ignoreInvalidAnswer(statp, from, msg, ans, &receivedFromNs);
                 needRetry) {
-                res_pquery({ans.data(), (resplen > ans.size()) ? ans.size() : resplen});
+                res_pquery(ans.first(resplen));
                 continue;
             }
 
@@ -1169,7 +1173,7 @@ static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg,
                 //  The case has to be captured here, as FORMERR packet do not
                 //  carry query section, hence res_queriesmatch() returns 0.
                 LOG(DEBUG) << __func__ << ": server rejected query with EDNS0:";
-                res_pquery({ans.data(), (resplen > ans.size()) ? ans.size() : resplen});
+                res_pquery(ans.first(resplen));
                 // record the error
                 statp->flags |= RES_F_EDNS0ERR;
                 *terrno = EREMOTEIO;
@@ -1178,7 +1182,7 @@ static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg,
 
             if (anhp->rcode == SERVFAIL || anhp->rcode == NOTIMP || anhp->rcode == REFUSED) {
                 LOG(DEBUG) << __func__ << ": server rejected query:";
-                res_pquery({ans.data(), (resplen > ans.size()) ? ans.size() : resplen});
+                res_pquery(ans.first(resplen));
                 *rcode = anhp->rcode;
                 continue;
             }
@@ -1212,7 +1216,8 @@ static int send_mdns(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans
 
     if (setupUdpSocket(statp, mdnsap, &fd, terrno) <= 0) return 0;
 
-    if (sendto(fd, msg.data(), msg.size(), 0, mdnsap, sockaddrSize(mdnsap)) != msg.size()) {
+    if (sendto(fd, msg.data(), msg.size(), 0, mdnsap, sockaddrSize(mdnsap)) !=
+        static_cast<ptrdiff_t>(msg.size())) {
         *terrno = errno;
         return 0;
     }
@@ -1305,7 +1310,6 @@ static int res_private_dns_send(ResState* statp, const Slice query, const Slice 
     PrivateDnsStatus privateDnsStatus = privateDnsConfiguration.getStatus(netId);
     statp->event->set_private_dns_modes(convertEnumType(privateDnsStatus.mode));
 
-    const bool enableDoH = isDoHEnabled();
     ssize_t result = -1;
     switch (privateDnsStatus.mode) {
         case PrivateDnsMode::OFF: {
@@ -1314,7 +1318,7 @@ static int res_private_dns_send(ResState* statp, const Slice query, const Slice 
         }
         case PrivateDnsMode::OPPORTUNISTIC: {
             *fallback = true;
-            if (enableDoH && privateDnsStatus.hasValidatedDohServers()) {
+            if (privateDnsStatus.hasValidatedDohServers()) {
                 result = res_doh_send(statp, query, answer, rcode);
                 if (result != DOH_RESULT_CAN_NOT_SEND) return result;
             }
@@ -1323,7 +1327,7 @@ static int res_private_dns_send(ResState* statp, const Slice query, const Slice 
         }
         case PrivateDnsMode::STRICT: {
             *fallback = false;
-            if (enableDoH && privateDnsStatus.hasValidatedDohServers()) {
+            if (privateDnsStatus.hasValidatedDohServers()) {
                 result = res_doh_send(statp, query, answer, rcode);
                 if (result != DOH_RESULT_CAN_NOT_SEND) return result;
             }
@@ -1349,7 +1353,7 @@ static int res_private_dns_send(ResState* statp, const Slice query, const Slice 
                     // ups.
                     privateDnsStatus = privateDnsConfiguration.getStatus(netId);
 
-                    if (enableDoH && privateDnsStatus.hasValidatedDohServers()) {
+                    if (privateDnsStatus.hasValidatedDohServers()) {
                         result = res_doh_send(statp, query, answer, rcode);
                         if (result != DOH_RESULT_CAN_NOT_SEND) return result;
                     }

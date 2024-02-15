@@ -68,7 +68,6 @@ bool verifyCallbacks() {
 
 DnsResolver* gDnsResolv = nullptr;
 ResolverNetdCallbacks gResNetdCallbacks;
-netdutils::Log gDnsResolverLog("dnsResolver");
 uint64_t gApiLevel = 0;
 
 DnsResolver* DnsResolver::getInstance() {
@@ -83,7 +82,7 @@ DnsResolver::DnsResolver() {
     auto& dnsTlsDispatcher = DnsTlsDispatcher::getInstance();
     auto& privateDnsConfiguration = PrivateDnsConfiguration::getInstance();
     privateDnsConfiguration.setObserver(&dnsTlsDispatcher);
-    if (isDoHEnabled()) privateDnsConfiguration.initDoh();
+    privateDnsConfiguration.initDoh();
 }
 
 bool DnsResolver::start() {

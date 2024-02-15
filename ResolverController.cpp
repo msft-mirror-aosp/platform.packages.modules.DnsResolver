@@ -37,9 +37,11 @@
 #include "stats.h"
 #include "util.h"
 
+using aidl::android::net::IDnsResolver;
 using aidl::android::net::ResolverParamsParcel;
 using aidl::android::net::resolv::aidl::IDnsResolverUnsolicitedEventListener;
 using aidl::android::net::resolv::aidl::Nat64PrefixEventParcel;
+using android::net::ResolverStats;
 
 namespace android {
 
@@ -79,8 +81,6 @@ void sendNat64PrefixEvent(const Dns64Configuration::Nat64PrefixInfo& args) {
 int getDnsInfo(unsigned netId, std::vector<std::string>* servers, std::vector<std::string>* domains,
                res_params* params, std::vector<android::net::ResolverStats>* stats,
                int* wait_for_pending_req_timeout_count) {
-    using aidl::android::net::IDnsResolver;
-    using android::net::ResolverStats;
     static_assert(ResolverStats::STATS_SUCCESSES == IDnsResolver::RESOLVER_STATS_SUCCESSES &&
                           ResolverStats::STATS_ERRORS == IDnsResolver::RESOLVER_STATS_ERRORS &&
                           ResolverStats::STATS_TIMEOUTS == IDnsResolver::RESOLVER_STATS_TIMEOUTS &&
@@ -155,11 +155,11 @@ int getDnsInfo(unsigned netId, std::vector<std::string>* servers, std::vector<st
 }  // namespace
 
 ResolverController::ResolverController()
-    : mDns64Configuration(
+    : mDns64Configuration(make_shared<Dns64Configuration>(
               [](uint32_t netId, uint32_t uid, android_net_context* netcontext) {
                   gResNetdCallbacks.get_network_context(netId, uid, netcontext);
               },
-              std::bind(sendNat64PrefixEvent, std::placeholders::_1)) {}
+              std::bind(sendNat64PrefixEvent, std::placeholders::_1))) {}
 
 void ResolverController::destroyNetworkCache(unsigned netId) {
     LOG(VERBOSE) << __func__ << ": netId = " << netId;
@@ -173,7 +173,7 @@ void ResolverController::destroyNetworkCache(unsigned netId) {
                                      event.network_type(), event.private_dns_modes(), bytesField);
 
     resolv_delete_cache_for_net(netId);
-    mDns64Configuration.stopPrefixDiscovery(netId);
+    mDns64Configuration->stopPrefixDiscovery(netId);
     privateDnsConfiguration.clear(netId);
 
     // Don't get this instance in PrivateDnsConfiguration. It's probe to deadlock.
@@ -192,8 +192,6 @@ int ResolverController::flushNetworkCache(unsigned netId) {
 }
 
 int ResolverController::setResolverConfiguration(const ResolverParamsParcel& resolverParams) {
-    using aidl::android::net::IDnsResolver;
-
     if (!has_named_cache(resolverParams.netId)) {
         return -ENOENT;
     }
@@ -239,7 +237,8 @@ int ResolverController::setResolverConfiguration(const ResolverParamsParcel& res
 
     return resolv_set_nameservers(resolverParams.netId, resolverParams.servers,
                                   resolverParams.domains, res_params,
-                                  resolverParams.resolverOptions, resolverParams.transportTypes);
+                                  resolverParams.resolverOptions, resolverParams.transportTypes,
+                                  resolverParams.meteredNetwork);
 }
 
 int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>* servers,
@@ -247,8 +246,6 @@ int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>*
                                         std::vector<std::string>* tlsServers,
                                         std::vector<int32_t>* params, std::vector<int32_t>* stats,
                                         int* wait_for_pending_req_timeout_count) {
-    using aidl::android::net::IDnsResolver;
-    using android::net::ResolverStats;
     res_params res_params;
     std::vector<ResolverStats> res_stats;
     int ret = getDnsInfo(netId, servers, domains, &res_params, &res_stats,
@@ -276,16 +273,16 @@ int ResolverController::getResolverInfo(int32_t netId, std::vector<std::string>*
 }
 
 void ResolverController::startPrefix64Discovery(int32_t netId) {
-    mDns64Configuration.startPrefixDiscovery(netId);
+    mDns64Configuration->startPrefixDiscovery(netId);
 }
 
 void ResolverController::stopPrefix64Discovery(int32_t netId) {
-    return mDns64Configuration.stopPrefixDiscovery(netId);
+    return mDns64Configuration->stopPrefixDiscovery(netId);
 }
 
 // TODO: use StatusOr<T> to wrap the result.
 int ResolverController::getPrefix64(unsigned netId, netdutils::IPPrefix* prefix) {
-    netdutils::IPPrefix p = mDns64Configuration.getPrefix64(netId);
+    netdutils::IPPrefix p = mDns64Configuration->getPrefix64(netId);
     if (p.family() != AF_INET6 || p.length() == 0) {
         return -ENOENT;
     }
@@ -295,7 +292,6 @@ int ResolverController::getPrefix64(unsigned netId, netdutils::IPPrefix* prefix)
 
 void ResolverController::dump(DumpWriter& dw, unsigned netId) {
     // No lock needed since Bionic's resolver locks all accessed data structures internally.
-    using android::net::ResolverStats;
     std::vector<std::string> servers;
     std::vector<std::string> domains;
     res_params params = {};
@@ -352,7 +348,7 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
                     params.max_samples, params.base_timeout_msec, params.retry_count);
         }
 
-        mDns64Configuration.dump(dw, netId);
+        mDns64Configuration->dump(dw, netId);
         const auto privateDnsStatus = PrivateDnsConfiguration::getInstance().getStatus(netId);
         dw.println("Private DNS mode: %s", getPrivateDnsModeString(privateDnsStatus.mode));
         if (privateDnsStatus.dotServersMap.size() == 0) {
