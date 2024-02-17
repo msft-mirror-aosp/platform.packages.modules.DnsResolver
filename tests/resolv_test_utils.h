@@ -431,6 +431,7 @@ android::netdutils::ScopedAddrinfo safe_getaddrinfo(const char* node, const char
 
 void SetMdnsRoute();
 void RemoveMdnsRoute();
+void AllowNetworkInBackground(int uid, bool allow);
 
 #define SKIP_IF_BEFORE_T                                                         \
     do {                                                                         \
