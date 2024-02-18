@@ -285,6 +285,7 @@ cc_test {
         "netd_aidl_interface-lateststable-ndk",
         "netd_event_listener_interface-lateststable-ndk",
         "libcrypto_static",
+        "libconnectivity_native_test_utils",
         "libcutils",
         "libdoh_ffi_for_test",
         "libgmock",
