@@ -129,8 +129,6 @@
 #define RESOLV_ALLOW_VERBOSE_LOGGING 0
 #endif
 
-using fmt::format_to;
-
 struct res_sym {
     int number;            /* Identifying number, like T_MX */
     const char* name;      /* Its symbolic name, like "MX" */
@@ -148,25 +146,25 @@ static void do_section(ns_msg* handle, ns_sect section) {
      */
     for (;;) {
         if (ns_parserr(handle, section, rrnum, &rr)) {
-            if (errno != ENODEV) format_to(out, "ns_parserr: {}", strerror(errno));
+            if (errno != ENODEV) fmt::format_to(out, "ns_parserr: {}", strerror(errno));
 
             LOG(VERBOSE) << s;
             return;
         }
         if (rrnum == 0) {
             int opcode = ns_msg_getflag(*handle, ns_f_opcode);
-            format_to(out, ";; {} SECTION:\n", p_section(section, opcode));
+            fmt::format_to(out, ";; {} SECTION:\n", p_section(section, opcode));
         }
         if (section == ns_s_qd)
-            format_to(out, ";;\t{}, type = {}, class = {}\n", ns_rr_name(rr),
-                      p_type(ns_rr_type(rr)), p_class(ns_rr_class(rr)));
+            fmt::format_to(out, ";;\t{}, type = {}, class = {}\n", ns_rr_name(rr),
+                           p_type(ns_rr_type(rr)), p_class(ns_rr_class(rr)));
         else if (section == ns_s_ar && ns_rr_type(rr) == ns_t_opt) {
             size_t rdatalen;
             uint16_t optcode, optlen;
 
             rdatalen = ns_rr_rdlen(rr);
-            format_to(out, "; EDNS: version: {}, udp={}, flags={}\n", (rr.ttl >> 16) & 0xff,
-                      static_cast<int>(ns_rr_class(rr)), rr.ttl & 0xffff);
+            fmt::format_to(out, "; EDNS: version: {}, udp={}, flags={}\n", (rr.ttl >> 16) & 0xff,
+                           static_cast<int>(ns_rr_class(rr)), rr.ttl & 0xffff);
             const uint8_t* cp = ns_rr_rdata(rr);
             while (rdatalen <= ns_rr_rdlen(rr) && rdatalen >= 4) {
                 int i;
@@ -175,33 +173,33 @@ static void do_section(ns_msg* handle, ns_sect section) {
                 GETSHORT(optlen, cp);
 
                 if (optcode == NS_OPT_NSID) {
-                    format_to(out, "; NSID: ");
+                    fmt::format_to(out, "; NSID: ");
                     if (optlen == 0) {
-                        format_to(out, "; NSID\n");
+                        fmt::format_to(out, "; NSID\n");
                     } else {
-                        format_to(out, "; NSID: ");
+                        fmt::format_to(out, "; NSID: ");
                         for (i = 0; i < optlen; i++) {
-                            format_to(out, "{:02x} ", cp[i]);
+                            fmt::format_to(out, "{:02x} ", cp[i]);
                         }
-                        format_to(out, " (");
+                        fmt::format_to(out, " (");
                         for (i = 0; i < optlen; i++) {
-                            format_to(out, "{} ", isprint(cp[i]) ? cp[i] : '.');
+                            fmt::format_to(out, "{} ", isprint(cp[i]) ? cp[i] : '.');
                         }
-                        format_to(out, ")\n");
+                        fmt::format_to(out, ")\n");
                     }
                 } else {
                     if (optlen == 0) {
-                        format_to(out, "; OPT={}\n", optcode);
+                        fmt::format_to(out, "; OPT={}\n", optcode);
                     } else {
-                        format_to(out, "; OPT={}: ", optcode);
+                        fmt::format_to(out, "; OPT={}: ", optcode);
                         for (i = 0; i < optlen; i++) {
-                            format_to(out, "{:02x} ", cp[i]);
+                            fmt::format_to(out, "{:02x} ", cp[i]);
                         }
-                        format_to(out, " (");
+                        fmt::format_to(out, " (");
                         for (i = 0; i < optlen; i++) {
-                            format_to(out, "{}", isprint(cp[i]) ? cp[i] : '.');
+                            fmt::format_to(out, "{}", isprint(cp[i]) ? cp[i] : '.');
                         }
-                        format_to(out, ")\n");
+                        fmt::format_to(out, ")\n");
                     }
                 }
                 rdatalen -= 4 + optlen;
@@ -216,16 +214,16 @@ static void do_section(ns_msg* handle, ns_sect section) {
                         buflen += 1024;
                         continue;
                     } else {
-                        format_to(out, "buflen over 131072");
+                        fmt::format_to(out, "buflen over 131072");
                         PLOG(VERBOSE) << s;
                         return;
                     }
                 }
-                format_to(out, "ns_sprintrr failed");
+                fmt::format_to(out, "ns_sprintrr failed");
                 PLOG(VERBOSE) << s;
                 return;
             }
-            format_to(out, ";; {}\n", buf.get());
+            fmt::format_to(out, ";; {}\n", buf.get());
         }
         rrnum++;
     }
@@ -273,19 +271,19 @@ void res_pquery(std::span<const uint8_t> msg) {
     std::string s = fmt::format(";; ->>HEADER<<- opcode: {}, status: {}, id: {}\n",
                                 _res_opcodes[opcode], p_rcode((int)rcode), id);
     auto out = std::back_inserter(s);
-    format_to(out, ";; flags:");
-    if (ns_msg_getflag(handle, ns_f_qr)) format_to(out, " qr");
-    if (ns_msg_getflag(handle, ns_f_aa)) format_to(out, " aa");
-    if (ns_msg_getflag(handle, ns_f_tc)) format_to(out, " tc");
-    if (ns_msg_getflag(handle, ns_f_rd)) format_to(out, " rd");
-    if (ns_msg_getflag(handle, ns_f_ra)) format_to(out, " ra");
-    if (ns_msg_getflag(handle, ns_f_z)) format_to(out, " ??");
-    if (ns_msg_getflag(handle, ns_f_ad)) format_to(out, " ad");
-    if (ns_msg_getflag(handle, ns_f_cd)) format_to(out, " cd");
-    format_to(out, "; {}: {}", p_section(ns_s_qd, (int)opcode), qdcount);
-    format_to(out, ", {}: {}", p_section(ns_s_an, (int)opcode), ancount);
-    format_to(out, ", {}: {}", p_section(ns_s_ns, (int)opcode), nscount);
-    format_to(out, ", {}: {}", p_section(ns_s_ar, (int)opcode), arcount);
+    fmt::format_to(out, ";; flags:");
+    if (ns_msg_getflag(handle, ns_f_qr)) fmt::format_to(out, " qr");
+    if (ns_msg_getflag(handle, ns_f_aa)) fmt::format_to(out, " aa");
+    if (ns_msg_getflag(handle, ns_f_tc)) fmt::format_to(out, " tc");
+    if (ns_msg_getflag(handle, ns_f_rd)) fmt::format_to(out, " rd");
+    if (ns_msg_getflag(handle, ns_f_ra)) fmt::format_to(out, " ra");
+    if (ns_msg_getflag(handle, ns_f_z)) fmt::format_to(out, " ??");
+    if (ns_msg_getflag(handle, ns_f_ad)) fmt::format_to(out, " ad");
+    if (ns_msg_getflag(handle, ns_f_cd)) fmt::format_to(out, " cd");
+    fmt::format_to(out, "; {}: {}", p_section(ns_s_qd, (int)opcode), qdcount);
+    fmt::format_to(out, ", {}: {}", p_section(ns_s_an, (int)opcode), ancount);
+    fmt::format_to(out, ", {}: {}", p_section(ns_s_ns, (int)opcode), nscount);
+    fmt::format_to(out, ", {}: {}", p_section(ns_s_ar, (int)opcode), arcount);
 
     LOG(VERBOSE) << s;
 
