@@ -1,4 +1,5 @@
 package {
+    default_team: "trendy_team_fwk_core_networking",
     default_applicable_licenses: ["packages_modules_DnsResolver_license"],
 }
 
@@ -44,8 +45,8 @@ cc_library_headers {
 
 cc_library_headers {
     name: "dnsproxyd_protocol_headers",
-    sdk_version: "29",
-    min_sdk_version: "29",
+    sdk_version: "30",
+    min_sdk_version: "30",
     export_include_dirs: ["include/dnsproxyd_protocol"],
     apex_available: [
         "//apex_available:platform",
@@ -53,7 +54,7 @@ cc_library_headers {
     ],
 }
 
-dnsresolver_aidl_interface_lateststable_version = "V10"
+dnsresolver_aidl_interface_lateststable_version = "V14"
 
 cc_library_static {
     name: "dnsresolver_aidl_interface-lateststable-ndk",
@@ -63,7 +64,7 @@ cc_library_static {
     apex_available: [
         "com.android.resolv",
     ],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 aidl_interface {
@@ -93,25 +94,74 @@ aidl_interface {
             apex_available: [
                 "com.android.resolv",
             ],
-            min_sdk_version: "29",
+            min_sdk_version: "30",
         },
     },
-    versions: [
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7",
-        "8",
-        "9",
-        "10",
-        "11",
-    ],
+
     dumpapi: {
         no_license: true,
     },
+    versions_with_info: [
+        {
+            version: "1",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "2",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "3",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "4",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "5",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "6",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "7",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "8",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "9",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "10",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "11",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "12",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "13",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+        {
+            version: "14",
+            imports: ["netd_event_listener_interface-V1"],
+        },
+
+    ],
+    frozen: true,
+
 }
 
 cc_defaults {
@@ -129,7 +179,7 @@ cc_defaults {
         "liblog",
     ],
     // This field is required to make test compatible with Q devices.
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 cc_defaults {
@@ -154,7 +204,7 @@ cc_defaults {
     // after the build process.
     host_required: [
         "net-tests-utils-host-common",
-    ]
+    ],
 }
 
 cc_defaults {
@@ -176,7 +226,7 @@ cc_defaults {
     // after the build process.
     host_required: [
         "net-tests-utils-host-common",
-    ]
+    ],
 }
 
 cc_library {
@@ -229,7 +279,6 @@ cc_library {
         "libmodules-utils-build",
         "libprotobuf-cpp-lite",
         "libstatslog_resolv",
-        "libstatspush_compat",
         "libsysutils",
         "netd_event_listener_interface-lateststable-ndk",
         "server_configurable_flags",
@@ -249,14 +298,13 @@ cc_library {
         "libcrypto",
         "liblog", //Used by libstatslog_resolv
         "libssl",
+        "libstatssocket",
+    ],
+    runtime_libs: [
+        "libcom.android.tethering.dns_helper",
     ],
     header_libs: [
         "libnetdbinder_utils_headers",
-    ],
-    runtime_libs: [
-        // Causes the linkerconfig to create a namespace link from resolv to the
-        // libstatssocket library within the statsd apex
-        "libstatssocket",
     ],
     export_include_dirs: ["include"],
 
@@ -275,7 +323,7 @@ cc_library {
         cfi: true,
     },
     apex_available: ["com.android.resolv"],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 cc_library_static {
@@ -289,14 +337,14 @@ cc_library_static {
         "stats.proto",
     ],
     apex_available: ["com.android.resolv"],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 genrule {
     name: "statslog_resolv.h",
     tools: ["stats-log-api-gen"],
     cmd: "$(location stats-log-api-gen) --header $(genDir)/statslog_resolv.h --module resolv" +
-        " --namespace android,net,stats --minApiLevel 29",
+        " --namespace android,net,stats --minApiLevel 30",
     out: [
         "statslog_resolv.h",
     ],
@@ -306,7 +354,7 @@ genrule {
     name: "statslog_resolv.cpp",
     tools: ["stats-log-api-gen"],
     cmd: "$(location stats-log-api-gen) --cpp $(genDir)/statslog_resolv.cpp --module resolv" +
-        " --namespace android,net,stats --importHeader statslog_resolv.h --minApiLevel 29",
+        " --namespace android,net,stats --importHeader statslog_resolv.h --minApiLevel 30",
     out: [
         "statslog_resolv.cpp",
     ],
@@ -320,13 +368,12 @@ cc_library_static {
     export_generated_headers: ["statslog_resolv.h"],
     static_libs: [
         "libcutils",
-        "libstatspush_compat",
     ],
-    header_libs: [
-        "libgtest_prod_headers", // Used by libstatspush_compat
+    shared_libs: [
+        "libstatssocket",
     ],
     apex_available: ["com.android.resolv"],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 filegroup {
@@ -362,6 +409,7 @@ doh_rust_deps = [
     "liblibc",
     "liblog_rust",
     "libring",
+    "libstatslog_rust",
     "libthiserror",
     "libtokio",
     "liburl",
@@ -385,7 +433,7 @@ rust_ffi_static {
         "//apex_available:platform", // Needed by doh_ffi_test
         "com.android.resolv",
     ],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 rust_test {
@@ -396,7 +444,7 @@ rust_test {
     test_suites: ["general-tests"],
     auto_gen_config: true,
     rustlibs: doh_rust_deps + ["libquiche_static"],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 // It's required by unit tests.
@@ -408,6 +456,11 @@ rust_ffi_static {
 
     rlibs: doh_rust_deps + ["libquiche_static"],
     prefer_rlib: true,
+
+    shared_libs: [
+        "libstatssocket",
+    ],
+
     // TODO(b/194022174), for unit tests to run on the Android 10 platform,
     // libunwind must be statically linked.
     whole_static_libs: ["libunwind"],
@@ -415,7 +468,7 @@ rust_ffi_static {
         "//apex_available:platform", // Needed by doh_ffi_test
         "com.android.resolv",
     ],
-    min_sdk_version: "29",
+    min_sdk_version: "30",
 }
 
 rust_ffi_static {
@@ -438,6 +491,7 @@ rust_ffi_static {
         "liblog_rust",
         "libquiche_static",
         "libring",
+        "libstatslog_rust",
         "libthiserror",
         "libtokio",
         "liburl",

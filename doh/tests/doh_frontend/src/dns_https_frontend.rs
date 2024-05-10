@@ -309,8 +309,8 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 }
             }
 
-            Ok((len, src)) = frontend_socket.recv_from(&mut frontend_buf) => {
-                debug!("Got {} bytes from {}", len, src);
+            Ok((len, peer)) = frontend_socket.recv_from(&mut frontend_buf) => {
+                debug!("Got {} bytes from {}", len, peer);
 
                 // Parse QUIC packet.
                 let pkt_buf = &mut frontend_buf[..len];
@@ -323,7 +323,8 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 };
                 debug!("Got QUIC packet: {:?}", hdr);
 
-                let client = match clients.get_or_create(&hdr, &src) {
+                let local = frontend_socket.local_addr()?;
+                let client = match clients.get_or_create(&hdr, &peer, &local) {
                     Ok(v) => v,
                     Err(e) => {
                         error!("Failed to get the client by the hdr {:?}: {}", hdr, e);
@@ -332,7 +333,7 @@ async fn worker_thread(params: WorkerParams) -> Result<()> {
                 };
                 debug!("Got client: {:?}", client);
 
-                match client.handle_frontend_message(pkt_buf) {
+                match client.handle_frontend_message(pkt_buf, &local) {
                     Ok(v) if !v.is_empty() => {
                         delay_queries_buffer.push(v);
                         queries_received += 1;
@@ -476,6 +477,9 @@ fn into_tokio_udp_socket(socket: std::net::UdpSocket) -> Result<UdpSocket> {
 
 fn build_pipe() -> Result<(File, File)> {
     let mut fds = [0, 0];
+    // SAFETY: The pointer we pass to `pipe` must be valid because it comes from a reference. The
+    // file descriptors it returns must be valid and open, so they are safe to pass to
+    // `File::from_raw_fd`.
     unsafe {
         if libc::pipe(fds.as_mut_ptr()) == 0 {
             return Ok((File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])));

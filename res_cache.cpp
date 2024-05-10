@@ -154,6 +154,7 @@ using std::span;
  * *****************************************
  */
 const int MAX_ENTRIES_DEFAULT = 64 * 2 * 5;
+const int MAX_ENTRIES_LOWER_BOUND = 1;
 const int MAX_ENTRIES_UPPER_BOUND = 100 * 1000;
 constexpr int DNSEVENT_SUBSAMPLING_MAP_DEFAULT_KEY = -1;
 
@@ -1007,7 +1008,7 @@ struct Cache {
                                                                         MAX_ENTRIES_DEFAULT);
         // Check both lower and upper bounds to prevent irrational values mistakenly pushed by
         // server.
-        if (entries < MAX_ENTRIES_DEFAULT || entries > MAX_ENTRIES_UPPER_BOUND) {
+        if (entries < MAX_ENTRIES_LOWER_BOUND || entries > MAX_ENTRIES_UPPER_BOUND) {
             LOG(ERROR) << "Misconfiguration on max_cache_entries " << entries;
             entries = MAX_ENTRIES_DEFAULT;
         }
@@ -1064,6 +1065,7 @@ struct NetConfig {
     int tc_mode = aidl::android::net::IDnsResolver::TC_MODE_DEFAULT;
     bool enforceDnsUid = false;
     std::vector<int32_t> transportTypes;
+    bool metered = false;
 };
 
 /* gets cache associated with a network, or NULL if none exists */
@@ -1213,7 +1215,7 @@ static void _cache_remove_oldest(Cache* cache) {
         return;
     }
     LOG(DEBUG) << __func__ << ": Cache full - removing oldest";
-    res_pquery({oldest->query, oldest->querylen});
+    res_pquery(std::span(oldest->query, oldest->querylen));
     _cache_remove_p(cache, lookup);
 }
 
@@ -1284,32 +1286,31 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
 
         if (!cache_has_pending_request_locked(cache, &key, true)) {
             return RESOLV_CACHE_NOTFOUND;
+        }
 
-        } else {
-            LOG(INFO) << __func__ << ": Waiting for previous request";
-            // wait until (1) timeout OR
-            //            (2) cv is notified AND no pending request matching the |key|
-            // (cv notifier should delete pending request before sending notification.)
-            bool ret = cv.wait_for(lock, std::chrono::seconds(PENDING_REQUEST_TIMEOUT),
-                                   [netid, &cache, &key]() REQUIRES(cache_mutex) {
-                                       // Must update cache as it could have been deleted
-                                       cache = find_named_cache_locked(netid);
-                                       return !cache_has_pending_request_locked(cache, &key, false);
-                                   });
-            if (!cache) {
-                return RESOLV_CACHE_NOTFOUND;
+        LOG(INFO) << __func__ << ": Waiting for previous request";
+        // wait until (1) timeout OR
+        //            (2) cv is notified AND no pending request matching the |key|
+        // (cv notifier should delete pending request before sending notification.)
+        const bool ret = cv.wait_for(lock, std::chrono::seconds(PENDING_REQUEST_TIMEOUT),
+                                [netid, &cache, &key]() REQUIRES(cache_mutex) {
+                                    // Must update cache as it could have been deleted
+                                    cache = find_named_cache_locked(netid);
+                                    return !cache_has_pending_request_locked(cache, &key, false);
+                                });
+        if (!cache) {
+            return RESOLV_CACHE_NOTFOUND;
+        }
+        if (ret == false) {
+            NetConfig* info = find_netconfig_locked(netid);
+            if (info != NULL) {
+                info->wait_for_pending_req_timeout_count++;
             }
-            if (ret == false) {
-                NetConfig* info = find_netconfig_locked(netid);
-                if (info != NULL) {
-                    info->wait_for_pending_req_timeout_count++;
-                }
-            }
-            lookup = _cache_lookup_p(cache, &key);
-            e = *lookup;
-            if (e == NULL) {
-                return RESOLV_CACHE_NOTFOUND;
-            }
+        }
+        lookup = _cache_lookup_p(cache, &key);
+        e = *lookup;
+        if (e == NULL) {
+            return RESOLV_CACHE_NOTFOUND;
         }
     }
 
@@ -1318,13 +1319,13 @@ ResolvCacheStatus resolv_cache_lookup(unsigned netid, span<const uint8_t> query,
     /* remove stale entries here */
     if (now >= e->expires) {
         LOG(DEBUG) << __func__ << ": NOT IN CACHE (STALE ENTRY " << *lookup << "DISCARDED)";
-        res_pquery({e->query, e->querylen});
+        res_pquery(std::span(e->query, e->querylen));
         _cache_remove_p(cache, lookup);
         return RESOLV_CACHE_NOTFOUND;
     }
 
     *answerlen = e->answerlen;
-    if (e->answerlen > answer.size()) {
+    if (e->answerlen > static_cast<ptrdiff_t>(answer.size())) {
         /* NOTE: we return UNSUPPORTED if the answer buffer is too short */
         LOG(INFO) << __func__ << ": ANSWER TOO LONG";
         return RESOLV_CACHE_UNSUPPORTED;
@@ -1642,7 +1643,7 @@ std::vector<std::string> getCustomizedTableByName(const size_t netid, const char
 int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& servers,
                            const std::vector<std::string>& domains, const res_params& params,
                            const std::optional<ResolverOptionsParcel> optionalResolverOptions,
-                           const std::vector<int32_t>& transportTypes) {
+                           const std::vector<int32_t>& transportTypes, bool metered) {
     std::vector<std::string> nameservers = filter_nameservers(servers);
     const int numservers = static_cast<int>(nameservers.size());
 
@@ -1709,6 +1710,7 @@ int resolv_set_nameservers(unsigned netid, const std::vector<std::string>& serve
         return -EINVAL;
     }
     netconfig->transportTypes = transportTypes;
+    netconfig->metered = metered;
     if (optionalResolverOptions.has_value()) {
         const ResolverOptionsParcel& resolverOptions = optionalResolverOptions.value();
         return netconfig->setOptions(resolverOptions);
@@ -2011,6 +2013,8 @@ static android::net::NetworkType to_stats_network_type(int32_t mainType, bool wi
             return withVpn ? android::net::NT_BLUETOOTH_VPN : android::net::NT_BLUETOOTH;
         case IDnsResolver::TRANSPORT_ETHERNET:
             return withVpn ? android::net::NT_ETHERNET_VPN : android::net::NT_ETHERNET;
+        case IDnsResolver::TRANSPORT_SATELLITE:
+            return withVpn ? android::net::NT_UNKNOWN : android::net::NT_SATELLITE;
         case IDnsResolver::TRANSPORT_VPN:
             return withVpn ? android::net::NT_UNKNOWN : android::net::NT_VPN;
         case IDnsResolver::TRANSPORT_WIFI_AWARE:
@@ -2078,6 +2082,8 @@ static const char* transport_type_to_str(const std::vector<int32_t>& transportTy
             return "ETHERNET_VPN";
         case android::net::NT_WIFI_CELLULAR_VPN:
             return "WIFI_CELLULAR_VPN";
+        case android::net::NT_SATELLITE:
+            return "SATELLITE";
         default:
             return "UNKNOWN";
     }
@@ -2090,6 +2096,7 @@ void resolv_netconfig_dump(DumpWriter& dw, unsigned netid) {
         // TODO: dump info->hosts
         dw.println("TC mode: %s", tc_mode_to_str(info->tc_mode));
         dw.println("TransportType: %s", transport_type_to_str(info->transportTypes));
+        dw.println("Metered: %s", info->metered ? "true" : "false");
     }
 }
 
@@ -2101,4 +2108,20 @@ int resolv_get_max_cache_entries(unsigned netid) {
         return -1;
     }
     return info->cache->get_max_cache_entries();
+}
+
+bool resolv_is_enforceDnsUid_enabled_network(unsigned netid) {
+    std::lock_guard guard(cache_mutex);
+    if (const auto info = find_netconfig_locked(netid); info != nullptr) {
+        return info->enforceDnsUid;
+    }
+    return false;
+}
+
+bool resolv_is_metered_network(unsigned netid) {
+    std::lock_guard guard(cache_mutex);
+    if (const auto info = find_netconfig_locked(netid); info != nullptr) {
+        return info->metered;
+    }
+    return false;
 }

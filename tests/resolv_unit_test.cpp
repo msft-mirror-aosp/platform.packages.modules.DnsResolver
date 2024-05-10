@@ -638,7 +638,7 @@ TEST_F(ResolvGetAddrInfoTest, ServerResponseError) {
     };
 
     for (const auto& config : testConfigs) {
-        SCOPED_TRACE(fmt::format("rcode: {}", config.rcode));
+        SCOPED_TRACE(fmt::format("rcode: {}", static_cast<int>(config.rcode)));
 
         test::DNSResponder dns(config.rcode);
         dns.addMapping(host_name, ns_type::ns_t_a, "1.2.3.4");
@@ -1538,7 +1538,7 @@ TEST_F(GetHostByNameForNetContextTest, ServerResponseError) {
     };
 
     for (const auto& config : testConfigs) {
-        SCOPED_TRACE(fmt::format("rcode: {}", config.rcode));
+        SCOPED_TRACE(fmt::format("rcode: {}", static_cast<int>(config.rcode)));
 
         test::DNSResponder dns(config.rcode);
         dns.addMapping(host_name, ns_type::ns_t_a, "1.2.3.4");
@@ -1895,6 +1895,7 @@ TEST_F(ResolvCommonFunctionTest, ConvertTransportsToNetworkType) {
             {android::net::NT_VPN, {IDnsResolver::TRANSPORT_VPN}},
             {android::net::NT_WIFI_AWARE, {IDnsResolver::TRANSPORT_WIFI_AWARE}},
             {android::net::NT_LOWPAN, {IDnsResolver::TRANSPORT_LOWPAN}},
+            {android::net::NT_SATELLITE, {IDnsResolver::TRANSPORT_SATELLITE}},
             {android::net::NT_CELLULAR_VPN,
              {IDnsResolver::TRANSPORT_CELLULAR, IDnsResolver::TRANSPORT_VPN}},
             {android::net::NT_CELLULAR_VPN,

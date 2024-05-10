@@ -50,6 +50,7 @@ constexpr int DNS_PORT = 53;
 // Constant values sync'd from res_cache.cpp
 constexpr int DNS_HEADER_SIZE = 12;
 constexpr int MAX_ENTRIES_DEFAULT = 64 * 2 * 5;
+constexpr int MAX_ENTRIES_LOWER_BOUND = 1;
 constexpr int MAX_ENTRIES_UPPER_BOUND = 100 * 1000;
 
 namespace {
@@ -65,6 +66,7 @@ struct SetupParams {
     res_params params;
     aidl::android::net::ResolverOptionsParcel resolverOptions;
     std::vector<int32_t> transportTypes;
+    bool metered;
 };
 
 struct CacheStats {
@@ -205,7 +207,7 @@ class ResolvCacheTest : public NetNativeTestBase {
 
     int cacheSetupResolver(uint32_t netId, const SetupParams& setup) {
         return resolv_set_nameservers(netId, setup.servers, setup.domains, setup.params,
-                                      setup.resolverOptions, setup.transportTypes);
+                                      setup.resolverOptions, setup.transportTypes, setup.metered);
     }
 
     void cacheAddStats(uint32_t netId, int revision_id, const IPSockAddr& ipsa,
@@ -627,7 +629,7 @@ class ResolvCacheParameterizedTest : public ResolvCacheTest,
                                      public testing::WithParamInterface<int> {};
 
 INSTANTIATE_TEST_SUITE_P(MaxCacheEntries, ResolvCacheParameterizedTest,
-                         testing::Values(0, MAX_ENTRIES_UPPER_BOUND + 1),
+                         testing::Values(MAX_ENTRIES_LOWER_BOUND - 1, MAX_ENTRIES_UPPER_BOUND + 1),
                          [](const testing::TestParamInfo<int>& info) {
                              return std::to_string(info.param);
                          });
@@ -925,6 +927,72 @@ TEST_F(ResolvCacheTest, GetResolverStats) {
     for (size_t i = 0; i < MAXNS; i++) {
         EXPECT_TRUE(cacheStats[i] == expectedStats2[i]);
     }
+}
+
+TEST_F(ResolvCacheTest, IsEnforceDnsUidEnabled) {
+    const SetupParams unenforcedDnsUidCfg = {
+            .servers = {"127.0.0.1", "::127.0.0.2", "fe80::3"},
+            .domains = {"domain1.com", "domain2.com"},
+            .params = kParams,
+    };
+    // Network #1
+    EXPECT_EQ(0, cacheCreate(TEST_NETID));
+    EXPECT_EQ(0, cacheSetupResolver(TEST_NETID, unenforcedDnsUidCfg));
+    EXPECT_FALSE(resolv_is_enforceDnsUid_enabled_network(TEST_NETID));
+
+    // Network #2
+    EXPECT_EQ(0, cacheCreate(TEST_NETID + 1));
+    EXPECT_EQ(0, cacheSetupResolver(TEST_NETID + 1, unenforcedDnsUidCfg));
+    EXPECT_FALSE(resolv_is_enforceDnsUid_enabled_network(TEST_NETID + 1));
+
+    // Change the enforceDnsUid setting on network #1
+    const SetupParams enforcedDnsUidCfg = {
+            .servers = {"127.0.0.1", "::127.0.0.2", "fe80::3"},
+            .domains = {"domain1.com", "domain2.com"},
+            .params = kParams,
+            .resolverOptions = {.enforceDnsUid = true},
+    };
+    EXPECT_EQ(0, cacheSetupResolver(TEST_NETID, enforcedDnsUidCfg));
+    EXPECT_TRUE(resolv_is_enforceDnsUid_enabled_network(TEST_NETID));
+
+    // Network #2 is unaffected
+    EXPECT_FALSE(resolv_is_enforceDnsUid_enabled_network(TEST_NETID + 1));
+
+    // Returns false on non-existent network
+    EXPECT_FALSE(resolv_is_enforceDnsUid_enabled_network(TEST_NETID + 2));
+}
+
+TEST_F(ResolvCacheTest, IsNetworkMetered) {
+    const SetupParams defaultCfg = {
+            .servers = {"127.0.0.1"},
+            .domains = {"domain1.com"},
+            .params = kParams,
+    };
+    // Network #1
+    EXPECT_EQ(0, cacheCreate(TEST_NETID));
+    EXPECT_EQ(0, cacheSetupResolver(TEST_NETID, defaultCfg));
+    EXPECT_FALSE(resolv_is_metered_network(TEST_NETID));
+
+    // Network #2
+    EXPECT_EQ(0, cacheCreate(TEST_NETID + 1));
+    EXPECT_EQ(0, cacheSetupResolver(TEST_NETID + 1, defaultCfg));
+    EXPECT_FALSE(resolv_is_metered_network(TEST_NETID + 1));
+
+    // Change the metered setting on network #1
+    const SetupParams meteredCfg = {
+            .servers = {"127.0.0.1"},
+            .domains = {"domain1.com"},
+            .params = kParams,
+            .metered = true,
+    };
+    EXPECT_EQ(0, cacheSetupResolver(TEST_NETID, meteredCfg));
+    EXPECT_TRUE(resolv_is_metered_network(TEST_NETID));
+
+    // Network #2 is unaffected
+    EXPECT_FALSE(resolv_is_metered_network(TEST_NETID + 1));
+
+    // Returns false on non-existent network
+    EXPECT_FALSE(resolv_is_metered_network(TEST_NETID + 2));
 }
 
 namespace {
