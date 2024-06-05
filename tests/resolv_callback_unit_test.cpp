@@ -108,6 +108,7 @@ class CallbackTest : public NetNativeTestBase {
         initDnsResolverCallbacks();
         // Create cache for test
         android::net::gDnsResolv->resolverCtrl.createNetworkCache(TEST_NETID);
+        AllowNetworkInBackground(TEST_UID, true);
     }
 
     void TearDown() override {
@@ -116,6 +117,7 @@ class CallbackTest : public NetNativeTestBase {
         resetDnsResolverCallbacks();
         // Delete cache for test
         android::net::gDnsResolv->resolverCtrl.destroyNetworkCache(TEST_NETID);
+        AllowNetworkInBackground(TEST_UID, false);
     }
 
     int SetResolvers() {

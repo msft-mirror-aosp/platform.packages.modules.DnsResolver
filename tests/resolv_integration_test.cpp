@@ -221,8 +221,14 @@ class ResolverTest : public NetNativeTestBase {
         // Start the binder thread pool for listening DNS metrics events and receiving death
         // recipient.
         ABinderProcess_startThreadPool();
+        AllowNetworkInBackground(TEST_UID, true);
+        AllowNetworkInBackground(TEST_UID2, true);
     }
-    static void TearDownTestSuite() { AIBinder_DeathRecipient_delete(sResolvDeathRecipient); }
+    static void TearDownTestSuite() {
+        AIBinder_DeathRecipient_delete(sResolvDeathRecipient);
+        AllowNetworkInBackground(TEST_UID, false);
+        AllowNetworkInBackground(TEST_UID2, false);
+    }
 
   protected:
     void SetUp() {

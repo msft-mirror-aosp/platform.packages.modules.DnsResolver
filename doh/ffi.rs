@@ -122,8 +122,8 @@ pub const DOH_LOG_LEVEL_TRACE: u32 = 4;
 
 const DOH_PORT: u16 = 443;
 
-fn level_from_u32(level: u32) -> Option<log::Level> {
-    use log::Level::*;
+fn level_from_u32(level: u32) -> Option<log::LevelFilter> {
+    use log::LevelFilter::*;
     match level {
         DOH_LOG_LEVEL_ERROR => Some(Error),
         DOH_LOG_LEVEL_WARN => Some(Warn),
@@ -139,17 +139,15 @@ fn level_from_u32(level: u32) -> Option<log::Level> {
 /// If called more than once, it will have no effect on subsequent calls.
 #[no_mangle]
 pub extern "C" fn doh_init_logger(level: u32) {
-    let log_level = level_from_u32(level).unwrap_or(log::Level::Error);
-    android_logger::init_once(android_logger::Config::default().with_min_level(log_level));
+    let log_level = level_from_u32(level).unwrap_or(log::LevelFilter::Error);
+    android_logger::init_once(android_logger::Config::default().with_max_level(log_level));
 }
 
 /// Set the log level.
 /// If an invalid level is passed, defaults to logging errors only.
 #[no_mangle]
 pub extern "C" fn doh_set_log_level(level: u32) {
-    let level_filter = level_from_u32(level)
-        .map(|level| level.to_level_filter())
-        .unwrap_or(log::LevelFilter::Error);
+    let level_filter = level_from_u32(level).unwrap_or(log::LevelFilter::Error);
     log::set_max_level(level_filter);
 }
 

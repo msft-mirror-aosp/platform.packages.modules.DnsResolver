@@ -21,6 +21,7 @@
 
 #include <android-base/chrono_utils.h>
 #include <android-base/logging.h>
+#include <firewall.h>
 
 using android::netdutils::ScopedAddrinfo;
 
@@ -228,6 +229,18 @@ void RemoveMdnsRoute() {
             "dev",           "lo", "proto", "static", "src",   "::1",
     };
     EXPECT_EQ(0, ForkAndRun(args_v6));
+}
+
+void AllowNetworkInBackground(int uid, bool allow) {
+    if (android::modules::sdklevel::IsAtLeastV()) {
+        // Background networking is always allowed on earlier versions.
+        Firewall* firewall = Firewall::getInstance();
+        if (allow) {
+            firewall->addRule(uid, BACKGROUND_MATCH);
+        } else {
+            firewall->removeRule(uid, BACKGROUND_MATCH);
+        }
+    }
 }
 
 bool is64bitAbi() {

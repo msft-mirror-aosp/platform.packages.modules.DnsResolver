@@ -199,6 +199,7 @@ interface IDnsResolver {
     const int TRANSPORT_TEST = 7;
     const int TRANSPORT_USB = 8;
     const int TRANSPORT_THREAD = 9;
+    const int TRANSPORT_SATELLITE = 10;
 
     /**
      * Sets the NAT64 prefix for the given network.
