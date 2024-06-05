@@ -22,6 +22,7 @@ cc_test_library {
     ],
     static_libs: [
         "netd_aidl_interface-lateststable-ndk",
+        "dnsresolver_aidl_interface-lateststable-ndk",
         "libconnectivity_native_test_utils",
         "libmodules-utils-build",
         "libnetd_test_dnsresponder_ndk",
@@ -207,8 +208,6 @@ cc_test {
         "dnsproxyd_protocol_headers",
         "libnetd_resolv_headers",
     ],
-    // TODO: make static link libc++ work.
-    //stl: "libc++_static",
     shared_libs: [
         "libbinder_ndk",
         "libnetd_client",
@@ -457,6 +456,9 @@ cc_fuzz {
         "libbase",
         "libbinder_random_parcel",
         "libcutils",
+    ],
+    shared_libs: [
+        "libcom.android.tethering.dns_helper",
     ],
     target: {
         android: {
