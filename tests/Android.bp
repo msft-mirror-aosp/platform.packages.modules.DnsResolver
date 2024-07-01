@@ -55,7 +55,6 @@ cc_binary_host {
     srcs: ["pbtxt2pb_converter_host.cpp"],
     static_libs: [
         "golddata_proto_host",
-        "libc++fs",
         "libprotobuf-cpp-full",
     ],
 }
@@ -214,7 +213,6 @@ cc_test {
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
-        "libc++fs",
         "libconnectivity_native_test_utils",
         "libcrypto_static",
         "libcutils",
@@ -353,6 +351,7 @@ cc_test {
         "resolv_test_defaults",
         "resolv_test_mts_coverage_without_root_defaults",
     ],
+    test_config: "doh_ffi_test_config.xml",
     header_libs: [
         "libnetd_resolv_internal_headers",
     ],
@@ -369,6 +368,10 @@ cc_test {
         "libnetd_client",
         "libstatssocket",
     ],
+    host_required: [
+        "net-tests-utils-host-common",
+    ],
+    data: [":ConnectivityTestPreparer"],
 }
 
 cc_defaults {
