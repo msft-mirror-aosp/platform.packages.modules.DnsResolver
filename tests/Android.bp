@@ -22,6 +22,7 @@ cc_test_library {
     ],
     static_libs: [
         "netd_aidl_interface-lateststable-ndk",
+        "dnsresolver_aidl_interface-lateststable-ndk",
         "libconnectivity_native_test_utils",
         "libmodules-utils-build",
         "libnetd_test_dnsresponder_ndk",
@@ -54,7 +55,6 @@ cc_binary_host {
     srcs: ["pbtxt2pb_converter_host.cpp"],
     static_libs: [
         "golddata_proto_host",
-        "libc++fs",
         "libprotobuf-cpp-full",
     ],
 }
@@ -207,15 +207,12 @@ cc_test {
         "dnsproxyd_protocol_headers",
         "libnetd_resolv_headers",
     ],
-    // TODO: make static link libc++ work.
-    //stl: "libc++_static",
     shared_libs: [
         "libbinder_ndk",
         "libnetd_client",
     ],
     static_libs: [
         "dnsresolver_aidl_interface-lateststable-ndk",
-        "libc++fs",
         "libconnectivity_native_test_utils",
         "libcrypto_static",
         "libcutils",
@@ -354,6 +351,7 @@ cc_test {
         "resolv_test_defaults",
         "resolv_test_mts_coverage_without_root_defaults",
     ],
+    test_config: "doh_ffi_test_config.xml",
     header_libs: [
         "libnetd_resolv_internal_headers",
     ],
@@ -370,6 +368,10 @@ cc_test {
         "libnetd_client",
         "libstatssocket",
     ],
+    host_required: [
+        "net-tests-utils-host-common",
+    ],
+    data: [":ConnectivityTestPreparer"],
 }
 
 cc_defaults {
@@ -457,6 +459,9 @@ cc_fuzz {
         "libbase",
         "libbinder_random_parcel",
         "libcutils",
+    ],
+    shared_libs: [
+        "libcom.android.tethering.dns_helper",
     ],
     target: {
         android: {
