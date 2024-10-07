@@ -215,9 +215,9 @@ int ResolverController::setResolverConfiguration(const ResolverParamsParcel& res
     // applies to UID 0, dns_mark is assigned for default network rathan the VPN. (note that it's
     // possible that a VPN doesn't have any DNS servers but DoT servers in DNS strict mode)
     auto& privateDnsConfiguration = PrivateDnsConfiguration::getInstance();
-    int err = privateDnsConfiguration.set(resolverParams.netId, netcontext.app_mark,
-                                          resolverParams.servers, tlsServers,
-                                          resolverParams.tlsName, resolverParams.caCertificate);
+    int err = privateDnsConfiguration.set(
+            resolverParams.netId, netcontext.app_mark, resolverParams.servers, tlsServers,
+            resolverParams.tlsName, resolverParams.caCertificate, resolverParams.dohParams);
 
     if (err != 0) {
         return err;
@@ -349,14 +349,27 @@ void ResolverController::dump(DumpWriter& dw, unsigned netId) {
         const auto privateDnsStatus = PrivateDnsConfiguration::getInstance().getStatus(netId);
         dw.println("Private DNS mode: %s", getPrivateDnsModeString(privateDnsStatus.mode));
         if (privateDnsStatus.dotServersMap.size() == 0) {
-            dw.println("No Private DNS servers configured");
+            dw.println("No DoT servers configured");
         } else {
-            dw.println("Private DNS configuration (%u entries)",
+            dw.println("DoT configuration (%u entries)",
                        static_cast<uint32_t>(privateDnsStatus.dotServersMap.size()));
             dw.incIndent();
             for (const auto& [server, validation] : privateDnsStatus.dotServersMap) {
                 dw.println("%s name{%s} status{%s}", server.toIpString().c_str(),
                            server.name.c_str(), validationStatusToString(validation));
+            }
+            dw.decIndent();
+        }
+        if (privateDnsStatus.dohServersMap.size() == 0) {
+            dw.println("No DoH servers configured");
+        } else {
+            // TODO: print the hostname and URL as well.
+            dw.println("DoH configuration (%u entries)",
+                       static_cast<uint32_t>(privateDnsStatus.dohServersMap.size()));
+            dw.incIndent();
+            for (const auto& [server, info] : privateDnsStatus.dohServersMap) {
+                dw.println("%s url{%s} status{%s}", server.toString().c_str(),
+                           info.httpsTemplate.c_str(), validationStatusToString(info.status));
             }
             dw.decIndent();
         }
