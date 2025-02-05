@@ -120,6 +120,8 @@ struct res_target {
     int qclass, qtype;                                                 // class and type of query
     std::vector<uint8_t> answer = std::vector<uint8_t>(MAXPACKET, 0);  // buffer to put answer
     int n = 0;                                                         // result length
+    // ResState this query should be run within
+    ResState* res_state;
 };
 
 static int explore_fqdn(const struct addrinfo*, const char*, const char*, struct addrinfo**,
@@ -151,9 +153,11 @@ static bool files_getaddrinfo(const size_t netid, const char* name, const addrin
 static int _find_src_addr(const struct sockaddr*, struct sockaddr*, unsigned, uid_t,
                           bool allow_v6_linklocal);
 
-static int res_searchN(const char* name, std::span<res_target> queries, ResState* res, int* herrno);
+static int res_searchN(const char* name, std::span<res_target> queries,
+                       std::span<std::string> search_domains, bool is_mdns,
+                       android::net::NetworkDnsEventReported* event, int* herrno);
 static int res_querydomainN(const char* name, const char* domain, std::span<res_target> queries,
-                            ResState* res, int* herrno);
+                            android::net::NetworkDnsEventReported* event, int* herrno);
 
 const char* const ai_errlist[] = {
         "Success",
@@ -212,16 +216,7 @@ void freeaddrinfo(struct addrinfo* ai) {
     }
 }
 
-/*
- * The following functions determine whether IPv4 or IPv6 connectivity is
- * available in order to implement AI_ADDRCONFIG.
- *
- * Strictly speaking, AI_ADDRCONFIG should not look at whether connectivity is
- * available, but whether addresses of the specified family are "configured
- * on the local system". However, bionic doesn't currently support getifaddrs,
- * so checking for connectivity is the next best thing.
- */
-static int have_ipv6(unsigned mark, uid_t uid, bool mdns) {
+static bool have_global_ipv6_connectivity(unsigned mark, uid_t uid) {
     static const struct sockaddr_in6 sin6_test = {
             .sin6_family = AF_INET6,
             .sin6_addr.s6_addr = {// 2000::
@@ -229,10 +224,31 @@ static int have_ipv6(unsigned mark, uid_t uid, bool mdns) {
     sockaddr_union addr = {.sin6 = sin6_test};
     sockaddr_storage sa;
     return _find_src_addr(&addr.sa, (struct sockaddr*)&sa, mark, uid,
-                          /*allow_v6_linklocal=*/mdns) == 1;
+                          /*allow_v6_linklocal=*/false) == 1;
 }
 
-static int have_ipv4(unsigned mark, uid_t uid) {
+static bool have_local_ipv6_connectivity(unsigned mark, uid_t uid, int netid) {
+    // IPv6 link-local addresses require a scope identifier to be correctly defined. This forces us
+    // to loop through all interfaces included within |netid|.
+    std::vector<std::string> interface_names = resolv_get_interface_names(netid);
+    for (const auto& interface_name : interface_names) {
+        const struct sockaddr_in6 sin6_test = {
+                .sin6_family = AF_INET6,
+                .sin6_addr.s6_addr =
+                        {// fe80::
+                         0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+                .sin6_scope_id = if_nametoindex(interface_name.c_str())};
+        sockaddr_union addr = {.sin6 = sin6_test};
+        sockaddr_storage sa;
+        if (_find_src_addr(&addr.sa, (struct sockaddr*)&sa, mark, uid,
+                           /*allow_v6_linklocal=*/true) == 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool have_ipv4_connectivity(unsigned mark, uid_t uid) {
     static const struct sockaddr_in sin_test = {
             .sin_family = AF_INET,
             .sin_addr.s_addr = __constant_htonl(0x08080808L)  // 8.8.8.8
@@ -302,6 +318,17 @@ int validateHints(const addrinfo* _Nonnull hints) {
     }
 
     return 0;
+}
+
+void fill_sin6_scope_id_if_needed(const res_target& query, addrinfo* addr_info) {
+    if (addr_info->ai_family != AF_INET6) {
+        return;
+    }
+
+    sockaddr_in6* sin6 = reinterpret_cast<sockaddr_in6*>(addr_info->ai_addr);
+    if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
+        sin6->sin6_scope_id = query.res_state->target_interface_index_for_mdns;
+    }
 }
 
 }  // namespace
@@ -1391,7 +1418,9 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
                            addrinfo** rv, NetworkDnsEventReported* event) {
     std::vector<res_target> queries;
     ResState res(netcontext, app_socket, event);
+
     setMdnsFlag(name, res.netid, &(res.flags));
+    bool is_mdns = isMdnsResolution(res.flags);
 
     bool query_ipv6 = false;
     bool query_ipv4 = false;
@@ -1400,9 +1429,14 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
         query_ipv6 = true;
         query_ipv4 = true;
         if (pai->ai_flags & AI_ADDRCONFIG) {
-            query_ipv6 =
-                    have_ipv6(netcontext->app_mark, netcontext->uid, isMdnsResolution(res.flags));
-            query_ipv4 = have_ipv4(netcontext->app_mark, netcontext->uid);
+            // Strictly speaking, AI_ADDRCONFIG should not look at whether connectivity is
+            // available, but whether addresses of the specified family are "configured on the local
+            // system". However, bionic doesn't currently support getifaddrs, so checking for
+            // connectivity is the next best thing.
+            query_ipv6 = have_global_ipv6_connectivity(netcontext->app_mark, netcontext->uid) ||
+                         (is_mdns && have_local_ipv6_connectivity(netcontext->app_mark,
+                                                                  netcontext->uid, res.netid));
+            query_ipv4 = have_ipv4_connectivity(netcontext->app_mark, netcontext->uid);
         }
     } else if (pai->ai_family == AF_INET) {
         query_ipv4 = true;
@@ -1412,26 +1446,57 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
         return EAI_FAMILY;
     }
 
-    if (query_ipv6) {
-        res_target ipv6_query;
-        ipv6_query.name = name;
-        ipv6_query.qclass = C_IN;
-        ipv6_query.qtype = T_AAAA;
-        queries.push_back(ipv6_query);
+    resolv_populate_res_for_net(&res);
+
+    std::vector<ResState> res_states;
+    if (is_mdns) {
+        // resolv_get_interface_names is also called within have_local_ipv6_connectivity. This is
+        // racy and the two could return different values. Having said that, the race condition is
+        // benign for the following reasons:
+        // 1. The first call is to figure out whether to send out an AAAA query.
+        // 2. The second call is to figure out which interfaces to the queries to.
+        // With the above in mind, if these value don't match only the following can happen:
+        // 1. The second call returns interfaces that didn't exist before. In this scenario, we will
+        //    send the query onto this additional interface. This is a good thing.
+        // 2. The second call returns an interface that didn't exist before. In this scenario, we
+        //    will not send the query onto this interface anymore. This is a good thing.
+        // One could argue that whether we're sending out an AAAA query or not is also affected by
+        // these network topology changes. But that is a race condition that cannot be avoided, as
+        // it could also happen while this code is returning results to the caller.
+        std::vector<std::string> interface_names = resolv_get_interface_names(res.netid);
+        for (const auto& interface_name : interface_names) {
+            res_states.emplace_back(res.clone(event)).target_interface_index_for_mdns =
+                    if_nametoindex(interface_name.c_str());
+        }
+    } else {
+        res_states.emplace_back(res.clone(event));
     }
-    if (query_ipv4) {
-        res_target ipv4_query;
-        ipv4_query.name = name;
-        ipv4_query.qclass = C_IN;
-        ipv4_query.qtype = T_A;
-        queries.push_back(ipv4_query);
+
+    for (auto& res_state : res_states) {
+        if (query_ipv6) {
+            res_target ipv6_query;
+            ipv6_query.name = name;
+            ipv6_query.qclass = C_IN;
+            ipv6_query.qtype = T_AAAA;
+            ipv6_query.res_state = &res_state;
+            queries.push_back(ipv6_query);
+        }
+        if (query_ipv4) {
+            res_target ipv4_query;
+            ipv4_query.name = name;
+            ipv4_query.qclass = C_IN;
+            ipv4_query.qtype = T_A;
+            ipv4_query.res_state = &res_state;
+            queries.push_back(ipv4_query);
+        }
     }
     if (queries.empty()) {
         return EAI_NODATA;
     }
 
     int he;
-    if (res_searchN(name, queries, &res, &he) < 0) {
+    // TODO: Refactor search_domains and event out of ResState (they really should not be there).
+    if (res_searchN(name, queries, res.search_domains, is_mdns, res.event, &he) < 0) {
         // Return h_errno (he) to catch more detailed errors rather than EAI_NODATA.
         // Note that res_searchN() doesn't set the pair NETDB_INTERNAL and errno.
         // See also herrnoToAiErrno().
@@ -1444,7 +1509,10 @@ static int dns_getaddrinfo(const char* name, const addrinfo* pai,
         addrinfo* ai = getanswer(query.answer, query.n, query.name, query.qtype, pai, &he);
         if (ai) {
             cur->ai_next = ai;
-            while (cur && cur->ai_next) cur = cur->ai_next;
+            while (cur && cur->ai_next) {
+                cur = cur->ai_next;
+                fill_sin6_scope_id_if_needed(query, cur);
+            }
         }
     }
 
@@ -1666,16 +1734,14 @@ QueryResult doQuery(const char* name, res_target* t, ResState* res,
 }  // namespace
 
 // This function runs doQuery() for each res_target in parallel.
-// The `target`, which is set in dns_getaddrinfo(), contains at most two res_target.
-static int res_queryN_parallel(const char* name, std::span<res_target> queries, ResState* res,
-                               int* herrno) {
+static int res_queryN_parallel(const char* name, std::span<res_target> queries,
+                               android::net::NetworkDnsEventReported* event, int* herrno) {
     std::vector<std::future<QueryResult>> results;
-    results.reserve(2);
     std::chrono::milliseconds sleepTimeMs{};
     bool is_first_iteration = true;
     for (auto& query : queries) {
-        results.emplace_back(
-                std::async(std::launch::async, doQuery, name, &query, res, sleepTimeMs));
+        results.emplace_back(std::async(std::launch::async, doQuery, name, &query, query.res_state,
+                                        sleepTimeMs));
         if (is_first_iteration) {
             // Avoiding gateways drop packets if queries are sent too close together
             // Only needed if we have multiple queries in a row.
@@ -1698,7 +1764,7 @@ static int res_queryN_parallel(const char* name, std::span<res_target> queries, 
             *herrno = r.herrno;
             return -1;
         }
-        res->event->MergeFrom(r.event);
+        event->MergeFrom(r.event);
         ancount += r.ancount;
         rcode = r.rcode;
         errno = r.qerrno;
@@ -1718,8 +1784,9 @@ static int res_queryN_parallel(const char* name, std::span<res_target> queries, 
  * If enabled, implement search rules until answer or unrecoverable failure
  * is detected.  Error code, if any, is left in *herrno.
  */
-static int res_searchN(const char* name, std::span<res_target> queries, ResState* res,
-                       int* herrno) {
+static int res_searchN(const char* name, std::span<res_target> queries,
+                       std::span<std::string> search_domains, bool is_mdns,
+                       android::net::NetworkDnsEventReported* event, int* herrno) {
     const char* cp;
     HEADER* hp;
     uint32_t dots;
@@ -1737,13 +1804,10 @@ static int res_searchN(const char* name, std::span<res_target> queries, ResState
     for (cp = name; *cp; cp++) dots += (*cp == '.');
     const bool trailing_dot = (cp > name && *--cp == '.') ? true : false;
 
-    /*
-     * If there are dots in the name already, let's just give it a try
-     * 'as is'.  The threshold can be set with the "ndots" option.
-     */
+    // If there are dots in the name already, let's just give it a try 'as is'.
     saved_herrno = -1;
-    if (dots >= res->ndots) {
-        ret = res_querydomainN(name, NULL, queries, res, herrno);
+    if (dots >= NDOTS) {
+        ret = res_querydomainN(name, NULL, queries, event, herrno);
         if (ret > 0) return (ret);
         saved_herrno = *herrno;
         tried_as_is++;
@@ -1751,19 +1815,13 @@ static int res_searchN(const char* name, std::span<res_target> queries, ResState
 
     /*
      * We do at least one level of search if
-     *	 - there is no dot, or
-     *	 - there is at least one dot and there is no trailing dot.
+     * - there is no dot, or
+     * - there is at least one dot and there is no trailing dot.
      * - this is not a .local mDNS lookup.
      */
-    if ((!dots || (dots && !trailing_dot)) && !isMdnsResolution(res->flags)) {
-        /* Unfortunately we need to set stuff up before
-         * the domain stuff is tried.  Will have a better
-         * fix after thread pools are used.
-         */
-        resolv_populate_res_for_net(res);
-
-        for (const auto& domain : res->search_domains) {
-            ret = res_querydomainN(name, domain.c_str(), queries, res, herrno);
+    if ((!dots || (dots && !trailing_dot)) && !is_mdns) {
+        for (const auto& domain : search_domains) {
+            ret = res_querydomainN(name, domain.c_str(), queries, event, herrno);
             if (ret > 0) return ret;
 
             /*
@@ -1807,7 +1865,7 @@ static int res_searchN(const char* name, std::span<res_target> queries, ResState
      * name or whether it ends with a dot.
      */
     if (!tried_as_is) {
-        ret = res_querydomainN(name, NULL, queries, res, herrno);
+        ret = res_querydomainN(name, NULL, queries, event, herrno);
         if (ret > 0) return ret;
     }
 
@@ -1831,7 +1889,7 @@ static int res_searchN(const char* name, std::span<res_target> queries, ResState
 // Perform a call on res_query on the concatenation of name and domain,
 // removing a trailing dot from name if domain is NULL.
 static int res_querydomainN(const char* name, const char* domain, std::span<res_target> queries,
-                            ResState* res, int* herrno) {
+                            android::net::NetworkDnsEventReported* event, int* herrno) {
     char nbuf[MAXDNAME];
     const char* longname = nbuf;
     size_t n, d;
@@ -1859,5 +1917,5 @@ static int res_querydomainN(const char* name, const char* domain, std::span<res_
         }
         snprintf(nbuf, sizeof(nbuf), "%s.%s", name, domain);
     }
-    return res_queryN_parallel(longname, queries, res, herrno);
+    return res_queryN_parallel(longname, queries, event, herrno);
 }

@@ -461,6 +461,39 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
     }
     res_pquery(msg);
 
+    // TODO(b/394031336): Implement caching for mDNS.
+    // The DNS cache keys by netid, ignoring the interface queries get routed towards. This is fine
+    // for unicast DNS requests, where:
+    // 1. We always send a single query per type (i.e., even if a network has multiple interfaces,
+    // we will send a single A and AAAA query).
+    // 2. Results cannot be IPv6 link-local addresses
+    // It is not fine for mDNS, where both things can happen.
+    if (isMdnsResolution(statp->flags)) {
+        // Use an impossible error code as default value.
+        int terrno = ETIME;
+        int resplen = 0;
+        *rcode = RCODE_INTERNAL_ERROR;
+        Stopwatch queryStopwatch;
+        resplen = send_mdns(statp, msg, ans, &terrno, rcode);
+        const IPSockAddr& receivedMdnsAddr =
+                (getQueryType(msg) == NS_T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
+        DnsQueryEvent* mDnsQueryEvent = addDnsQueryEvent(statp->event);
+        mDnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(RESOLV_CACHE_NOTFOUND));
+        mDnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
+        mDnsQueryEvent->set_ip_version(ipFamilyToIPVersion(receivedMdnsAddr.family()));
+        mDnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
+        mDnsQueryEvent->set_protocol(PROTO_MDNS);
+        mDnsQueryEvent->set_type(getQueryType(msg));
+        mDnsQueryEvent->set_linux_errno(static_cast<LinuxErrno>(terrno));
+        resolv_stats_add(statp->netid, receivedMdnsAddr, mDnsQueryEvent);
+
+        if (resplen > 0) {
+            LOG(DEBUG) << __func__ << ": got answer from mDNS:";
+            res_pquery(ans.first(resplen));
+            return resplen;
+        }
+    }
+
     int anslen = 0;
     Stopwatch cacheStopwatch;
     ResolvCacheStatus cache_status = resolv_cache_lookup(statp->netid, msg, ans, &anslen, flags);
@@ -477,37 +510,6 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
         // had a cache miss for a known network, so populate the thread private
         // data so the normal resolve path can do its thing
         resolv_populate_res_for_net(statp);
-    }
-
-    // MDNS
-    if (isMdnsResolution(statp->flags)) {
-        // Use an impossible error code as default value.
-        int terrno = ETIME;
-        int resplen = 0;
-        *rcode = RCODE_INTERNAL_ERROR;
-        Stopwatch queryStopwatch;
-        resplen = send_mdns(statp, msg, ans, &terrno, rcode);
-        const IPSockAddr& receivedMdnsAddr =
-                (getQueryType(msg) == NS_T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
-        DnsQueryEvent* mDnsQueryEvent = addDnsQueryEvent(statp->event);
-        mDnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(cache_status));
-        mDnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
-        mDnsQueryEvent->set_ip_version(ipFamilyToIPVersion(receivedMdnsAddr.family()));
-        mDnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
-        mDnsQueryEvent->set_protocol(PROTO_MDNS);
-        mDnsQueryEvent->set_type(getQueryType(msg));
-        mDnsQueryEvent->set_linux_errno(static_cast<LinuxErrno>(terrno));
-        resolv_stats_add(statp->netid, receivedMdnsAddr, mDnsQueryEvent);
-
-        if (resplen > 0) {
-            LOG(DEBUG) << __func__ << ": got answer from mDNS:";
-            res_pquery(ans.first(resplen));
-
-            if (cache_status == RESOLV_CACHE_NOTFOUND) {
-                resolv_cache_add(statp->netid, msg, std::span(ans.data(), resplen));
-            }
-            return resplen;
-        }
     }
 
     if (statp->nameserverCount() == 0) {
@@ -1237,6 +1239,24 @@ static int send_mdns(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans
     unique_fd fd;
 
     if (setupUdpSocket(statp, mdnsap, &fd, terrno) <= 0) return 0;
+
+    if (statp->target_interface_index_for_mdns != 0) {
+        if (mdnsap->sa_family == AF_INET) {
+            struct ip_mreqn mreqn = {};
+            mreqn.imr_ifindex = statp->target_interface_index_for_mdns;
+            if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &mreqn, sizeof(mreqn)) < 0) {
+                *terrno = errno;
+                return 0;
+            }
+        } else if (mdnsap->sa_family == AF_INET6) {
+            if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_IF,
+                           &statp->target_interface_index_for_mdns,
+                           sizeof(statp->target_interface_index_for_mdns)) < 0) {
+                *terrno = errno;
+                return 0;
+            }
+        }
+    }
 
     if (sendto(fd, msg.data(), msg.size(), 0, mdnsap, sockaddrSize(mdnsap)) !=
         static_cast<ptrdiff_t>(msg.size())) {
