@@ -87,13 +87,19 @@ union sockaddr_union {
     struct sockaddr_in sin;
     struct sockaddr_in6 sin6;
 };
+
 constexpr int MAXPACKET = 8 * 1024;
 
+// Threshold for initial abs. query
+inline constexpr int NDOTS = 1;
+
 struct ResState {
-    ResState(const android_net_context* netcontext, android::net::NetworkDnsEventReported* dnsEvent)
+    ResState(const android_net_context* netcontext, std::optional<int> app_socket,
+             android::net::NetworkDnsEventReported* dnsEvent)
         : netid(netcontext->dns_netid),
           uid(netcontext->uid),
           pid(netcontext->pid),
+          app_socket(app_socket),
           mark(netcontext->dns_mark),
           event(dnsEvent),
           netcontext_flags(netcontext->flags) {}
@@ -105,10 +111,10 @@ struct ResState {
         copy.netid = netid;
         copy.uid = uid;
         copy.pid = pid;
+        copy.app_socket = app_socket;
         copy.search_domains = search_domains;
         copy.nsaddrs = nsaddrs;
         copy.udpsocks_ts = udpsocks_ts;
-        copy.ndots = ndots;
         copy.mark = mark;
         copy.tcp_nssock_ts = tcp_nssock_ts;
         copy.flags = flags;
@@ -117,6 +123,7 @@ struct ResState {
         copy.tc_mode = tc_mode;
         copy.enforce_dns_uid = enforce_dns_uid;
         copy.sort_nameservers = sort_nameservers;
+        copy.target_interface_index_for_mdns = target_interface_index_for_mdns;
         return copy;
     }
     void closeSockets() {
@@ -134,11 +141,11 @@ struct ResState {
     unsigned netid;                             // NetId: cache key and socket mark
     uid_t uid;                                  // uid of the app that sent the DNS lookup
     pid_t pid;                                  // pid of the app that sent the DNS lookup
+    std::optional<int> app_socket;              // Communication socket with the querier process
     std::vector<std::string> search_domains{};  // domains to search
     std::vector<android::netdutils::IPSockAddr> nsaddrs;
     std::array<timespec, MAXNS> udpsocks_ts;    // The creation time of the UDP sockets
     android::base::unique_fd udpsocks[MAXNS];   // UDP sockets to nameservers
-    unsigned ndots : 4 = 1;                     // threshold for initial abs. query
     unsigned mark;                              // Socket mark to be used by all DNS query sockets
     android::base::unique_fd tcp_nssock;        // TCP socket (but why not one per nameserver?)
     timespec tcp_nssock_ts = {};                // The creation time of the TCP socket
@@ -148,6 +155,7 @@ struct ResState {
     int tc_mode = 0;
     bool enforce_dns_uid = false;
     bool sort_nameservers = false;              // True if nsaddrs has been sorted.
+    int target_interface_index_for_mdns;
     // clang-format on
 
   private:
@@ -242,8 +250,7 @@ inline void resolv_tag_socket(int sock, uid_t uid, pid_t pid) {
         }
     }
 
-    // fchown() apps' uid only in R+, since it's incompatible with Q's ebpf vpn isolation feature.
-    if (fchown(sock, (android::net::gApiLevel >= 30) ? uid : AID_DNS, -1) == -1) {
+    if (fchown(sock, uid, -1) == -1) {
         PLOG(WARNING) << "Failed to chown socket";
     }
 }
