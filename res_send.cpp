@@ -151,6 +151,7 @@ using android::netdutils::Slice;
 using android::netdutils::Stopwatch;
 using std::span;
 
+// Order matters: we put IPv6 first to prioritize that.
 const std::vector<IPSockAddr> mdns_addrs = {IPSockAddr::toIPSockAddr("ff02::fb", 5353),
                                             IPSockAddr::toIPSockAddr("224.0.0.251", 5353)};
 
@@ -160,7 +161,7 @@ static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg,
 static int send_vc(ResState* statp, res_params* params, span<const uint8_t> msg, span<uint8_t> ans,
                    int* terrno, size_t ns, int* rcode);
 static int send_mdns(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* terrno,
-                     int* rcode);
+                     int* rcode, IPSockAddr* receivedMdnsAddr);
 static void dump_error(const char*, const struct sockaddr*);
 
 static int sock_eq(struct sockaddr*, struct sockaddr*);
@@ -461,6 +462,38 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
     }
     res_pquery(msg);
 
+    // TODO(b/394031336): Implement caching for mDNS.
+    // The DNS cache keys by netid, ignoring the interface queries get routed towards. This is fine
+    // for unicast DNS requests, where:
+    // 1. We always send a single query per type (i.e., even if a network has multiple interfaces,
+    // we will send a single A and AAAA query).
+    // 2. Results cannot be IPv6 link-local addresses
+    // It is not fine for mDNS, where both things can happen.
+    if (isMdnsResolution(statp->flags)) {
+        // Use an impossible error code as default value.
+        int terrno = ETIME;
+        int resplen = 0;
+        *rcode = RCODE_INTERNAL_ERROR;
+        Stopwatch queryStopwatch;
+        IPSockAddr receivedMdnsAddr;
+        resplen = send_mdns(statp, msg, ans, &terrno, rcode, &receivedMdnsAddr);
+        DnsQueryEvent* mDnsQueryEvent = addDnsQueryEvent(statp->event);
+        mDnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(RESOLV_CACHE_NOTFOUND));
+        mDnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
+        mDnsQueryEvent->set_ip_version(ipFamilyToIPVersion(receivedMdnsAddr.family()));
+        mDnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
+        mDnsQueryEvent->set_protocol(PROTO_MDNS);
+        mDnsQueryEvent->set_type(getQueryType(msg));
+        mDnsQueryEvent->set_linux_errno(static_cast<LinuxErrno>(terrno));
+        resolv_stats_add(statp->netid, receivedMdnsAddr, mDnsQueryEvent);
+
+        if (resplen > 0) {
+            LOG(DEBUG) << __func__ << ": got answer from mDNS:";
+            res_pquery(ans.first(resplen));
+            return resplen;
+        }
+    }
+
     int anslen = 0;
     Stopwatch cacheStopwatch;
     ResolvCacheStatus cache_status = resolv_cache_lookup(statp->netid, msg, ans, &anslen, flags);
@@ -477,37 +510,6 @@ int res_nsend(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* 
         // had a cache miss for a known network, so populate the thread private
         // data so the normal resolve path can do its thing
         resolv_populate_res_for_net(statp);
-    }
-
-    // MDNS
-    if (isMdnsResolution(statp->flags)) {
-        // Use an impossible error code as default value.
-        int terrno = ETIME;
-        int resplen = 0;
-        *rcode = RCODE_INTERNAL_ERROR;
-        Stopwatch queryStopwatch;
-        resplen = send_mdns(statp, msg, ans, &terrno, rcode);
-        const IPSockAddr& receivedMdnsAddr =
-                (getQueryType(msg) == NS_T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
-        DnsQueryEvent* mDnsQueryEvent = addDnsQueryEvent(statp->event);
-        mDnsQueryEvent->set_cache_hit(static_cast<CacheStatus>(cache_status));
-        mDnsQueryEvent->set_latency_micros(saturate_cast<int32_t>(queryStopwatch.timeTakenUs()));
-        mDnsQueryEvent->set_ip_version(ipFamilyToIPVersion(receivedMdnsAddr.family()));
-        mDnsQueryEvent->set_rcode(static_cast<NsRcode>(*rcode));
-        mDnsQueryEvent->set_protocol(PROTO_MDNS);
-        mDnsQueryEvent->set_type(getQueryType(msg));
-        mDnsQueryEvent->set_linux_errno(static_cast<LinuxErrno>(terrno));
-        resolv_stats_add(statp->netid, receivedMdnsAddr, mDnsQueryEvent);
-
-        if (resplen > 0) {
-            LOG(DEBUG) << __func__ << ": got answer from mDNS:";
-            res_pquery(ans.first(resplen));
-
-            if (cache_status == RESOLV_CACHE_NOTFOUND) {
-                resolv_cache_add(statp->netid, msg, std::span(ans.data(), resplen));
-            }
-            return resplen;
-        }
     }
 
     if (statp->nameserverCount() == 0) {
@@ -1231,55 +1233,78 @@ static int send_dg(ResState* statp, res_params* params, span<const uint8_t> msg,
 // return length - when receiving valid packets.
 // return 0      - when mdns packets transfer error.
 static int send_mdns(ResState* statp, span<const uint8_t> msg, span<uint8_t> ans, int* terrno,
-                     int* rcode) {
-    const sockaddr_storage ss = (getQueryType(msg) == NS_T_AAAA) ? mdns_addrs[0] : mdns_addrs[1];
-    const sockaddr* mdnsap = reinterpret_cast<const sockaddr*>(&ss);
-    unique_fd fd;
+                     int* rcode, IPSockAddr* receivedMdnsAddr) {
+    for (const auto& mdns_addr : mdns_addrs) {
+        const sockaddr_storage ss = mdns_addr;
+        *receivedMdnsAddr = mdns_addr;
+        const sockaddr* mdnsap = reinterpret_cast<const sockaddr*>(&ss);
+        unique_fd fd;
 
-    if (setupUdpSocket(statp, mdnsap, &fd, terrno) <= 0) return 0;
+        if (setupUdpSocket(statp, mdnsap, &fd, terrno) <= 0) return 0;
 
-    if (sendto(fd, msg.data(), msg.size(), 0, mdnsap, sockaddrSize(mdnsap)) !=
-        static_cast<ptrdiff_t>(msg.size())) {
-        *terrno = errno;
-        return 0;
+        if (statp->target_interface_index_for_mdns != 0) {
+            if (mdnsap->sa_family == AF_INET) {
+                struct ip_mreqn mreqn = {};
+                mreqn.imr_ifindex = statp->target_interface_index_for_mdns;
+                if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &mreqn, sizeof(mreqn)) < 0) {
+                    *terrno = errno;
+                    continue;
+                }
+            } else if (mdnsap->sa_family == AF_INET6) {
+                if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_IF,
+                               &statp->target_interface_index_for_mdns,
+                               sizeof(statp->target_interface_index_for_mdns)) < 0) {
+                    *terrno = errno;
+                    continue;
+                }
+            }
+        }
+
+        if (sendto(fd, msg.data(), msg.size(), 0, mdnsap, sockaddrSize(mdnsap)) !=
+            static_cast<ptrdiff_t>(msg.size())) {
+            *terrno = errno;
+            continue;
+        }
+        // RFC 6762: Typically, the timeout would also be shortened to two or three seconds.
+        const struct timespec finish = evAddTime(evNowTime(), {2, 2000000});
+
+        // Wait for reply.
+        if (retrying_poll(fd, POLLIN, &finish) <= 0) {
+            *terrno = errno;
+            if (*terrno == ETIMEDOUT) *rcode = RCODE_TIMEOUT;
+            LOG(ERROR) << __func__ << ": " << ((*terrno == ETIMEDOUT) ? "timeout" : "poll failed");
+            continue;
+        }
+
+        sockaddr_storage from;
+        socklen_t fromlen = sizeof(from);
+        int resplen = recvfrom(fd, ans.data(), ans.size(), 0, (sockaddr*)(void*)&from, &fromlen);
+
+        if (resplen <= 0) {
+            *terrno = errno;
+            continue;
+        }
+
+        if (resplen < HFIXEDSZ) {
+            // Undersized message.
+            LOG(ERROR) << __func__ << ": undersized: " << resplen;
+            *terrno = EMSGSIZE;
+            continue;
+        }
+
+        HEADER* anhp = (HEADER*)(void*)ans.data();
+        if (anhp->tc) {
+            LOG(DEBUG) << __func__ << ": truncated answer";
+            *terrno = E2BIG;
+            continue;
+        }
+
+        *rcode = anhp->rcode;
+        *terrno = 0;
+        return resplen;
     }
-    // RFC 6762: Typically, the timeout would also be shortened to two or three seconds.
-    const struct timespec finish = evAddTime(evNowTime(), {2, 2000000});
 
-    // Wait for reply.
-    if (retrying_poll(fd, POLLIN, &finish) <= 0) {
-        *terrno = errno;
-        if (*terrno == ETIMEDOUT) *rcode = RCODE_TIMEOUT;
-        LOG(ERROR) << __func__ << ": " << ((*terrno == ETIMEDOUT) ? "timeout" : "poll failed");
-        return 0;
-    }
-
-    sockaddr_storage from;
-    socklen_t fromlen = sizeof(from);
-    int resplen = recvfrom(fd, ans.data(), ans.size(), 0, (sockaddr*)(void*)&from, &fromlen);
-
-    if (resplen <= 0) {
-        *terrno = errno;
-        return 0;
-    }
-
-    if (resplen < HFIXEDSZ) {
-        // Undersized message.
-        LOG(ERROR) << __func__ << ": undersized: " << resplen;
-        *terrno = EMSGSIZE;
-        return 0;
-    }
-
-    HEADER* anhp = (HEADER*)(void*)ans.data();
-    if (anhp->tc) {
-        LOG(DEBUG) << __func__ << ": truncated answer";
-        *terrno = E2BIG;
-        return 0;
-    }
-
-    *rcode = anhp->rcode;
-    *terrno = 0;
-    return resplen;
+    return 0;
 }
 
 static void dump_error(const char* str, const struct sockaddr* address) {
